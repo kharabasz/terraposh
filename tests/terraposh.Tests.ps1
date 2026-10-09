@@ -265,20 +265,41 @@ InModuleScope terraposh {
         }
     }
 
-    Describe 'ConvertTo-GpgvPath' {
-        It 'uses forward slashes on Windows' {
-            Mock Get-TerraformOS { 'windows' }
-
-            ConvertTo-GpgvPath -Path 'C:\Users\me\AppData\Local\Temp\terraposh-1\hashicorp.gpg' | Should -BeExactly 'C:/Users/me/AppData/Local/Temp/terraposh-1/hashicorp.gpg'
+    Describe 'Invoke-Gpgv' -Skip:($IsWindows) {
+        BeforeAll {
+            $FakeGpgv = Join-Path -Path $TestDrive -ChildPath 'gpgv'
+            Set-Content -Path $FakeGpgv -Value @(
+                '#!/bin/sh'
+                'echo "cwd=$(pwd -P)"'
+                'for a in "$@"; do echo "arg=$a"; done'
+                'echo "gpgv: to stderr" >&2'
+                'exit 3'
+            )
+            chmod +x $FakeGpgv
+            $WorkDirectory = Join-Path -Path $TestDrive -ChildPath 'work'
+            New-Item -Path $WorkDirectory -ItemType Directory | Out-Null
         }
 
-        It 'leaves paths unchanged on <OS>' -TestCases @(
-            @{ OS = 'linux' }
-            @{ OS = 'darwin' }
-        ) {
-            Mock Get-TerraformOS { $OS }
+        It 'runs gpgv in the work directory with only relative names' {
+            $Result = Invoke-Gpgv -GpgvPath $FakeGpgv -WorkingDirectory $WorkDirectory
 
-            ConvertTo-GpgvPath -Path '/tmp/terraposh-1/hashicorp.gpg' | Should -BeExactly '/tmp/terraposh-1/hashicorp.gpg'
+            $Result.Status[0] | Should -Be "cwd=$((Get-Item -Path $WorkDirectory).ResolvedTarget ?? (Resolve-Path -Path $WorkDirectory).ProviderPath)"
+            $Result.Status[1..9] | Should -Be @('arg=--homedir', 'arg=.', 'arg=--status-fd', 'arg=1', 'arg=--keyring', 'arg=hashicorp.gpg', 'arg=SHA256SUMS.sig', 'arg=SHA256SUMS')
+        }
+
+        It 'separates stdout status lines from stderr and returns the exit code' {
+            $Result = Invoke-Gpgv -GpgvPath $FakeGpgv -WorkingDirectory $WorkDirectory
+
+            $Result.ExitCode | Should -Be 3
+            $Result.Errors | Should -Be @('gpgv: to stderr')
+            $Result.Status | Should -Not -Contain 'gpgv: to stderr'
+        }
+
+        It 'restores the current location' {
+            $Before = $PWD.Path
+            Invoke-Gpgv -GpgvPath $FakeGpgv -WorkingDirectory $WorkDirectory | Out-Null
+
+            $PWD.Path | Should -Be $Before
         }
     }
 
@@ -306,14 +327,15 @@ InModuleScope terraposh {
             { Assert-TerraformChecksumsSignature -Release $Release -ChecksumsFile $ChecksumsFile } | Should -Not -Throw
 
             Should -Invoke Invoke-TerraformReleaseRequest -Exactly -Times 1 -ParameterFilter { $Uri -eq $Release.SignatureUri }
-            Should -Invoke Invoke-Gpgv -Exactly -Times 1 -ParameterFilter { $File -eq $ChecksumsFile -and $GpgvPath -eq '/opt/gnupg/bin/gpgv' }
+            Should -Invoke Invoke-Gpgv -Exactly -Times 1 -ParameterFilter { $GpgvPath -eq '/opt/gnupg/bin/gpgv' }
         }
 
-        It 'passes gpgv only the bundled key, in an isolated home directory' {
+        It 'gives gpgv only the bundled key, the checksums and the signature in an isolated directory' {
             Mock Invoke-Gpgv {
-                $KeyringName | Should -BeExactly 'hashicorp.gpg'
-                [System.IO.File]::ReadAllBytes((Join-Path -Path $HomeDirectory -ChildPath $KeyringName)) | Should -Be (ConvertFrom-ArmoredPgpKey -Path $HashiCorpKeyFile)
-                Get-ChildItem -Path $HomeDirectory -Force | Should -HaveCount 2
+                (Get-ChildItem -Path $WorkingDirectory -Force).Name | Sort-Object | Should -Be @('hashicorp.gpg', 'SHA256SUMS', 'SHA256SUMS.sig')
+                [System.IO.File]::ReadAllBytes((Join-Path -Path $WorkingDirectory -ChildPath 'hashicorp.gpg')) | Should -Be (ConvertFrom-ArmoredPgpKey -Path $HashiCorpKeyFile)
+                Get-Content -Path (Join-Path -Path $WorkingDirectory -ChildPath 'SHA256SUMS') -Raw | Should -Be (Get-Content -Path $ChecksumsFile -Raw)
+                Get-Content -Path (Join-Path -Path $WorkingDirectory -ChildPath 'SHA256SUMS.sig') -Raw | Should -Be "sig$([Environment]::NewLine)"
                 @{ ExitCode = 0; Status = @(New-ValidSig $HashiCorpKeyFingerprint); Errors = @() }
             }
 

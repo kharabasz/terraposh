@@ -492,38 +492,24 @@ function Get-GpgvPath {
     return $null
 }
 
-function ConvertTo-GpgvPath {
-    param (
-        [string]$Path
-    )
-
-    if ((Get-TerraformOS) -eq 'windows') {
-        return $Path -replace '\\', '/'
-    }
-
-    return $Path
-}
-
 function Invoke-Gpgv {
     param (
         [string]$GpgvPath,
-        [string]$KeyringName,
-        [string]$Signature,
-        [string]$File,
-        [string]$HomeDirectory
+        [string]$WorkingDirectory
     )
 
-    $Arguments = @(
-        '--homedir', (ConvertTo-GpgvPath -Path $HomeDirectory)
-        '--status-fd', '1'
-        '--keyring', $KeyringName
-        (ConvertTo-GpgvPath -Path $Signature)
-        (ConvertTo-GpgvPath -Path $File)
-    )
-    $Output = & $GpgvPath @Arguments 2>&1
+    Push-Location -Path $WorkingDirectory
+
+    try {
+        $Output = & $GpgvPath --homedir . --status-fd 1 --keyring hashicorp.gpg SHA256SUMS.sig SHA256SUMS 2>&1
+        $ExitCode = $LASTEXITCODE
+    }
+    finally {
+        Pop-Location
+    }
 
     return @{
-        ExitCode = $LASTEXITCODE
+        ExitCode = $ExitCode
         Status   = @($Output | Where-Object { $_ -is [string] })
         Errors   = @($Output | Where-Object { $_ -is [ErrorRecord] } | ForEach-Object { "$_" })
     }
@@ -544,12 +530,10 @@ function Assert-TerraformChecksumsSignature {
     $WorkDirectory = New-TerraposhTemporaryDirectory
 
     try {
-        $KeyringName = 'hashicorp.gpg'
-        $Keyring = Join-Path -Path $WorkDirectory -ChildPath $KeyringName
-        $SignatureFile = Join-Path -Path $WorkDirectory -ChildPath 'SHA256SUMS.sig'
-        [System.IO.File]::WriteAllBytes($Keyring, (ConvertFrom-ArmoredPgpKey -Path $HashiCorpKeyFile))
-        Invoke-TerraformReleaseRequest -Uri $Release.SignatureUri -OutFile $SignatureFile
-        $Result = Invoke-Gpgv -GpgvPath $GpgvPath -KeyringName $KeyringName -Signature $SignatureFile -File $ChecksumsFile -HomeDirectory $WorkDirectory
+        [System.IO.File]::WriteAllBytes((Join-Path -Path $WorkDirectory -ChildPath 'hashicorp.gpg'), (ConvertFrom-ArmoredPgpKey -Path $HashiCorpKeyFile))
+        Copy-Item -Path $ChecksumsFile -Destination (Join-Path -Path $WorkDirectory -ChildPath 'SHA256SUMS')
+        Invoke-TerraformReleaseRequest -Uri $Release.SignatureUri -OutFile (Join-Path -Path $WorkDirectory -ChildPath 'SHA256SUMS.sig')
+        $Result = Invoke-Gpgv -GpgvPath $GpgvPath -WorkingDirectory $WorkDirectory
     }
     finally {
         Remove-Item -Path $WorkDirectory -Recurse -Force -ErrorAction Ignore
