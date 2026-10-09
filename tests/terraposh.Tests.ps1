@@ -311,8 +311,8 @@ InModuleScope terraposh {
 
         It 'passes gpgv only the bundled key, in an isolated home directory' {
             Mock Invoke-Gpgv {
-                [System.IO.File]::ReadAllBytes($Keyring) | Should -Be (ConvertFrom-ArmoredPgpKey -Path $HashiCorpKeyFile)
-                Split-Path -Parent $Keyring | Should -Be $HomeDirectory
+                $KeyringName | Should -BeExactly 'hashicorp.gpg'
+                [System.IO.File]::ReadAllBytes((Join-Path -Path $HomeDirectory -ChildPath $KeyringName)) | Should -Be (ConvertFrom-ArmoredPgpKey -Path $HashiCorpKeyFile)
                 Get-ChildItem -Path $HomeDirectory -Force | Should -HaveCount 2
                 @{ ExitCode = 0; Status = @(New-ValidSig $HashiCorpKeyFingerprint); Errors = @() }
             }

@@ -507,7 +507,7 @@ function ConvertTo-GpgvPath {
 function Invoke-Gpgv {
     param (
         [string]$GpgvPath,
-        [string]$Keyring,
+        [string]$KeyringName,
         [string]$Signature,
         [string]$File,
         [string]$HomeDirectory
@@ -516,7 +516,7 @@ function Invoke-Gpgv {
     $Arguments = @(
         '--homedir', (ConvertTo-GpgvPath -Path $HomeDirectory)
         '--status-fd', '1'
-        '--keyring', (ConvertTo-GpgvPath -Path $Keyring)
+        '--keyring', $KeyringName
         (ConvertTo-GpgvPath -Path $Signature)
         (ConvertTo-GpgvPath -Path $File)
     )
@@ -544,11 +544,12 @@ function Assert-TerraformChecksumsSignature {
     $WorkDirectory = New-TerraposhTemporaryDirectory
 
     try {
-        $Keyring = Join-Path -Path $WorkDirectory -ChildPath 'hashicorp.gpg'
+        $KeyringName = 'hashicorp.gpg'
+        $Keyring = Join-Path -Path $WorkDirectory -ChildPath $KeyringName
         $SignatureFile = Join-Path -Path $WorkDirectory -ChildPath 'SHA256SUMS.sig'
         [System.IO.File]::WriteAllBytes($Keyring, (ConvertFrom-ArmoredPgpKey -Path $HashiCorpKeyFile))
         Invoke-TerraformReleaseRequest -Uri $Release.SignatureUri -OutFile $SignatureFile
-        $Result = Invoke-Gpgv -GpgvPath $GpgvPath -Keyring $Keyring -Signature $SignatureFile -File $ChecksumsFile -HomeDirectory $WorkDirectory
+        $Result = Invoke-Gpgv -GpgvPath $GpgvPath -KeyringName $KeyringName -Signature $SignatureFile -File $ChecksumsFile -HomeDirectory $WorkDirectory
     }
     finally {
         Remove-Item -Path $WorkDirectory -Recurse -Force -ErrorAction Ignore
