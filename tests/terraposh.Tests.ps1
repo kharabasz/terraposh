@@ -661,10 +661,17 @@ InModuleScope terraposh {
 
     Describe 'Get-TerraformBinary against releases.hashicorp.com' -Tag 'Integration' {
         BeforeAll {
-            Mock Set-TerraformVendoredDirectory {
-                $Directory = Join-Path -Path $TestDrive -ChildPath 'vendored'
-                New-Item -Path $Directory -ItemType Directory -Force | Out-Null
-                return $Directory
+            $script:IntegrationVendored = Join-Path -Path ([System.IO.Path]::GetTempPath()) -ChildPath "terraposh-integration-$([guid]::NewGuid().ToString('N'))"
+            New-Item -Path $script:IntegrationVendored -ItemType Directory | Out-Null
+            Mock Set-TerraformVendoredDirectory { $script:IntegrationVendored }
+        }
+
+        AfterAll {
+            $Deadline = [DateTime]::UtcNow.AddSeconds(30)
+
+            while ((Test-Path -Path $script:IntegrationVendored) -and [DateTime]::UtcNow -lt $Deadline) {
+                Remove-Item -Path $script:IntegrationVendored -Recurse -Force -ErrorAction Ignore
+                Start-Sleep -Milliseconds 500
             }
         }
 
