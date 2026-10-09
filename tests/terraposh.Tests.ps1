@@ -25,18 +25,6 @@ InModuleScope terraposh {
         }
     }
 
-    Describe 'Get-TerraformFallbackArchitecture' {
-        It 'returns <Expected> for <OS>_<Architecture>' -TestCases @(
-            @{ OS = 'darwin'; Architecture = 'arm64'; Expected = 'amd64' }
-            @{ OS = 'windows'; Architecture = 'arm64'; Expected = 'amd64' }
-            @{ OS = 'linux'; Architecture = 'arm64'; Expected = $null }
-            @{ OS = 'darwin'; Architecture = 'amd64'; Expected = $null }
-            @{ OS = 'linux'; Architecture = 'amd64'; Expected = $null }
-        ) {
-            Get-TerraformFallbackArchitecture -OS $OS -Architecture $Architecture | Should -Be $Expected
-        }
-    }
-
     Describe 'Get-TerraformRelease' {
         BeforeEach {
             Mock Set-TerraformVendoredDirectory { Join-Path -Path $TestDrive -ChildPath 'vendored' }
@@ -106,6 +94,16 @@ InModuleScope terraposh {
             Should -Invoke Invoke-WebRequest -Times 0
         }
 
+        It 'returns the response bytes without OutFile' {
+            Mock Invoke-WebRequest { [pscustomobject]@{ RawContentStream = [System.IO.MemoryStream]::new([byte[]](1, 2, 3)) } }
+
+            $Bytes = Invoke-TerraformReleaseRequest -Uri 'https://releases.hashicorp.com/terraform/1.9.8/terraform_1.9.8_SHA256SUMS'
+
+            $Bytes -is [byte[]] | Should -BeTrue
+            $Bytes | Should -Be @(1, 2, 3)
+            Should -Invoke Invoke-WebRequest -Exactly -Times 1 -ParameterFilter { $MaximumRedirection -eq 0 -and -not $OutFile }
+        }
+
         It 'downloads over HTTPS without following redirects' {
             Invoke-TerraformReleaseRequest -Uri 'https://releases.hashicorp.com/terraform/1.9.8/terraform_1.9.8_SHA256SUMS' -OutFile 'out'
 
@@ -128,7 +126,8 @@ InModuleScope terraposh {
 
         BeforeEach {
             $script:Sums = "${HashA}  terraform_1.9.8_linux_amd64.zip`n${HashB}  terraform_1.9.8_darwin_arm64.zip`n`n"
-            Mock Invoke-TerraformReleaseRequest { Set-Content -Path $OutFile -Value $script:Sums -NoNewline }
+            Mock Invoke-TerraformReleaseRequest { , [System.Text.Encoding]::UTF8.GetBytes($script:Sums) } -ParameterFilter { $Uri -like '*_SHA256SUMS' }
+            Mock Invoke-TerraformReleaseRequest { , [byte[]](9, 9, 9) } -ParameterFilter { $Uri -like '*.sig' }
             Mock Assert-TerraformChecksumsSignature {}
         }
 
@@ -138,7 +137,6 @@ InModuleScope terraposh {
             $Checksums.Count | Should -Be 2
             $Checksums['terraform_1.9.8_linux_amd64.zip'] | Should -Be ('a' * 64)
             $Checksums['terraform_1.9.8_darwin_arm64.zip'] | Should -Be $HashB
-            Should -Invoke Invoke-TerraformReleaseRequest -Exactly -Times 1 -ParameterFilter { $Uri -eq $Release.ChecksumsUri }
         }
 
         It 'handles CRLF line endings' {
@@ -159,13 +157,15 @@ InModuleScope terraposh {
             { Get-TerraformReleaseChecksums -Release $Release } | Should -Throw '*Malformed SHA256SUMS entry*'
         }
 
-        It 'verifies the downloaded checksum bytes' {
+        It 'verifies the downloaded checksums against the downloaded signature' {
             Mock Assert-TerraformChecksumsSignature {
                 [System.Text.Encoding]::UTF8.GetString($ChecksumsBytes) | Should -BeExactly $script:Sums
+                $SignatureBytes | Should -Be @(9, 9, 9)
+                $Source | Should -Be 'https://releases.hashicorp.com/terraform/1.9.8/terraform_1.9.8_SHA256SUMS'
             }
 
             Get-TerraformReleaseChecksums -Release $Release | Out-Null
-            Should -Invoke Assert-TerraformChecksumsSignature -Exactly -Times 1 -ParameterFilter { $Release.ChecksumsUri -eq 'https://releases.hashicorp.com/terraform/1.9.8/terraform_1.9.8_SHA256SUMS' }
+            Should -Invoke Assert-TerraformChecksumsSignature -Exactly -Times 1
         }
 
         It 'checks the signature before parsing' {
@@ -174,289 +174,73 @@ InModuleScope terraposh {
 
             { Get-TerraformReleaseChecksums -Release $Release } | Should -Throw '*PGP signature verification failed*'
         }
-
-        It 'parses exactly the bytes that were verified' {
-            $script:Downloaded = @{}
-            Mock Invoke-TerraformReleaseRequest {
-                Set-Content -Path $OutFile -Value $script:Sums -NoNewline
-                $script:Downloaded.Path = $OutFile
-            }
-            Mock Assert-TerraformChecksumsSignature {
-                if (Test-Path -Path $script:Downloaded.Path) {
-                    Set-Content -Path $script:Downloaded.Path -Value "$('c' * 64)  terraform_1.9.8_linux_amd64.zip" -NoNewline
-                }
-            }
-
-            (Get-TerraformReleaseChecksums -Release $Release)['terraform_1.9.8_linux_amd64.zip'] | Should -Be ('a' * 64)
-        }
-
-        It 'cleans up its temporary directory' {
-            $Before = @(Get-ChildItem -Path ([System.IO.Path]::GetTempPath()) -Filter 'terraposh-*' -ErrorAction Ignore).Count
-            Get-TerraformReleaseChecksums -Release $Release | Out-Null
-
-            @(Get-ChildItem -Path ([System.IO.Path]::GetTempPath()) -Filter 'terraposh-*' -ErrorAction Ignore).Count | Should -Be $Before
-        }
-    }
-
-    Describe 'ConvertFrom-ArmoredPgpKey' {
-        It 'decodes the bundled HashiCorp key to the pinned fingerprint' {
-            $Bytes = ConvertFrom-ArmoredPgpKey -Path $HashiCorpKeyFile
-
-            $Bytes[0] | Should -Be 0x99
-            $PacketLength = 3 + ([int]$Bytes[1] -shl 8) + $Bytes[2]
-            $Fingerprint = [System.Convert]::ToHexString([System.Security.Cryptography.SHA1]::HashData([byte[]]$Bytes[0..($PacketLength - 1)]))
-
-            $Fingerprint | Should -Be $HashiCorpKeyFingerprint
-            $HashiCorpKeyFingerprint | Should -BeLike "*${HashiCorpKeyId}"
-        }
-
-        It 'ignores armor headers and the CRC line' {
-            $File = Join-Path -Path $TestDrive -ChildPath 'key.asc'
-            Set-Content -Path $File -Value @(
-                '-----BEGIN PGP PUBLIC KEY BLOCK-----'
-                'Comment: test'
-                ''
-                [System.Convert]::ToBase64String([byte[]](1, 2, 3))
-                '=abcd'
-                '-----END PGP PUBLIC KEY BLOCK-----'
-            )
-
-            ConvertFrom-ArmoredPgpKey -Path $File | Should -Be @(1, 2, 3)
-        }
-
-        It 'throws when there is no key block' {
-            $File = Join-Path -Path $TestDrive -ChildPath 'empty.asc'
-            Set-Content -Path $File -Value 'not a key'
-
-            { ConvertFrom-ArmoredPgpKey -Path $File } | Should -Throw '*No PGP public key block*'
-        }
-    }
-
-    Describe 'Get-GpgvPath' {
-        It 'returns gpgv from PATH' {
-            Mock Get-Command { [pscustomobject]@{ Source = '/usr/bin/gpgv' } } -ParameterFilter { $Name -eq 'gpgv' }
-
-            Get-GpgvPath | Should -Be '/usr/bin/gpgv'
-        }
-
-        Context 'gpgv not on PATH' {
-            BeforeAll {
-                $EnvironmentNames = @('ProgramW6432', 'ProgramFiles', 'ProgramFiles(x86)', 'LOCALAPPDATA', 'SCOOP', 'USERPROFILE')
-
-                function New-FakeFile([string]$Path) {
-                    New-Item -Path $Path -ItemType File -Force | Out-Null
-                    return $Path
-                }
-            }
-
-            BeforeEach {
-                Mock Get-Command { $null } -ParameterFilter { $Name -eq 'gpgv' }
-                Mock Get-Command { $null } -ParameterFilter { $Name -eq 'git' }
-                Mock Get-TerraformOS { 'windows' }
-
-                $script:SavedEnvironment = @{}
-                $Root = Join-Path -Path $TestDrive -ChildPath ([guid]::NewGuid())
-
-                foreach ($EnvironmentName in $EnvironmentNames) {
-                    $script:SavedEnvironment[$EnvironmentName] = [Environment]::GetEnvironmentVariable($EnvironmentName)
-                    [Environment]::SetEnvironmentVariable($EnvironmentName, $null)
-                }
-
-                $env:ProgramW6432 = Join-Path -Path $Root -ChildPath 'Program Files'
-                $env:ProgramFiles = Join-Path -Path $Root -ChildPath 'Program Files'
-                ${env:ProgramFiles(x86)} = Join-Path -Path $Root -ChildPath 'Program Files (x86)'
-                $env:LOCALAPPDATA = Join-Path -Path $Root -ChildPath 'AppData' -AdditionalChildPath 'Local'
-                $env:USERPROFILE = Join-Path -Path $Root -ChildPath 'User'
-            }
-
-            AfterEach {
-                foreach ($EnvironmentName in $EnvironmentNames) {
-                    [Environment]::SetEnvironmentVariable($EnvironmentName, $script:SavedEnvironment[$EnvironmentName])
-                }
-            }
-
-            It 'finds Git for Windows'' gpgv next to git on PATH (<Layout>)' -TestCases @(
-                @{ Layout = 'cmd'; GitRelative = 'cmd' }
-                @{ Layout = 'bin'; GitRelative = 'bin' }
-                @{ Layout = 'mingw64\bin'; GitRelative = 'mingw64/bin' }
-            ) {
-                $GitRoot = Join-Path -Path $TestDrive -ChildPath "Custom Git $([guid]::NewGuid())"
-                $GitExe = New-FakeFile (Join-Path -Path $GitRoot -ChildPath $GitRelative -AdditionalChildPath 'git.exe')
-                $Gpgv = New-FakeFile (Join-Path -Path $GitRoot -ChildPath 'usr' -AdditionalChildPath 'bin', 'gpgv.exe')
-                Mock Get-Command { [pscustomobject]@{ Source = $GitExe } } -ParameterFilter { $Name -eq 'git' }
-
-                Get-GpgvPath | Should -Be $Gpgv
-            }
-
-            It 'finds gpgv in <Location>' -TestCases @(
-                @{ Location = 'Program Files\Git'; Relative = { Join-Path -Path $env:ProgramFiles -ChildPath 'Git' -AdditionalChildPath 'usr', 'bin', 'gpgv.exe' } }
-                @{ Location = 'Program Files (x86)\Git'; Relative = { Join-Path -Path ${env:ProgramFiles(x86)} -ChildPath 'Git' -AdditionalChildPath 'usr', 'bin', 'gpgv.exe' } }
-                @{ Location = 'a per-user Git install'; Relative = { Join-Path -Path $env:LOCALAPPDATA -ChildPath 'Programs' -AdditionalChildPath 'Git', 'usr', 'bin', 'gpgv.exe' } }
-                @{ Location = 'Scoop under the user profile'; Relative = { Join-Path -Path $env:USERPROFILE -ChildPath 'scoop' -AdditionalChildPath 'apps', 'git', 'current', 'usr', 'bin', 'gpgv.exe' } }
-                @{ Location = 'Gpg4win'; Relative = { Join-Path -Path ${env:ProgramFiles(x86)} -ChildPath 'GnuPG' -AdditionalChildPath 'bin', 'gpgv.exe' } }
-            ) {
-                $Gpgv = New-FakeFile (& $Relative)
-
-                Get-GpgvPath | Should -Be $Gpgv
-            }
-
-            It 'finds gpgv in a custom Scoop root' {
-                $env:SCOOP = Join-Path -Path $TestDrive -ChildPath "scoop $([guid]::NewGuid())"
-                $Gpgv = New-FakeFile (Join-Path -Path $env:SCOOP -ChildPath 'apps' -AdditionalChildPath 'git', 'current', 'usr', 'bin', 'gpgv.exe')
-
-                Get-GpgvPath | Should -Be $Gpgv
-            }
-
-            It 'prefers the Git next to git on PATH over a Program Files install' {
-                New-FakeFile (Join-Path -Path $env:ProgramFiles -ChildPath 'Git' -AdditionalChildPath 'usr', 'bin', 'gpgv.exe') | Out-Null
-                $GitRoot = Join-Path -Path $TestDrive -ChildPath "Custom Git $([guid]::NewGuid())"
-                $GitExe = New-FakeFile (Join-Path -Path $GitRoot -ChildPath 'cmd' -AdditionalChildPath 'git.exe')
-                $Gpgv = New-FakeFile (Join-Path -Path $GitRoot -ChildPath 'usr' -AdditionalChildPath 'bin', 'gpgv.exe')
-                Mock Get-Command { [pscustomobject]@{ Source = $GitExe } } -ParameterFilter { $Name -eq 'git' }
-
-                Get-GpgvPath | Should -Be $Gpgv
-            }
-
-            It 'ignores a directory named gpgv.exe' {
-                New-Item -Path (Join-Path -Path $env:ProgramFiles -ChildPath 'Git' -AdditionalChildPath 'usr', 'bin', 'gpgv.exe') -ItemType Directory -Force | Out-Null
-
-                Get-GpgvPath | Should -BeNullOrEmpty
-            }
-
-            It 'returns nothing on Windows when no gpgv is installed' {
-                Get-GpgvPath | Should -BeNullOrEmpty
-            }
-
-            It 'does not search Windows locations on <OS>' -TestCases @(
-                @{ OS = 'linux' }
-                @{ OS = 'darwin' }
-            ) {
-                Mock Get-TerraformOS { $OS }
-                New-FakeFile (Join-Path -Path $env:ProgramFiles -ChildPath 'Git' -AdditionalChildPath 'usr', 'bin', 'gpgv.exe') | Out-Null
-
-                Get-GpgvPath | Should -BeNullOrEmpty
-            }
-        }
-    }
-
-    Describe 'Invoke-Gpgv' -Skip:($IsWindows) {
-        BeforeAll {
-            $FakeGpgv = Join-Path -Path $TestDrive -ChildPath 'gpgv'
-            Set-Content -Path $FakeGpgv -Value @(
-                '#!/bin/sh'
-                'echo "cwd=$(pwd -P)"'
-                'for a in "$@"; do echo "arg=$a"; done'
-                'echo "gpgv: to stderr" >&2'
-                'exit 3'
-            )
-            chmod +x $FakeGpgv
-            $WorkDirectory = Join-Path -Path $TestDrive -ChildPath 'work'
-            New-Item -Path $WorkDirectory -ItemType Directory | Out-Null
-        }
-
-        It 'runs gpgv in the work directory with only relative names' {
-            $Result = Invoke-Gpgv -GpgvPath $FakeGpgv -WorkingDirectory $WorkDirectory
-
-            $Result.Status[0] | Should -Be "cwd=$((Get-Item -Path $WorkDirectory).ResolvedTarget ?? (Resolve-Path -Path $WorkDirectory).ProviderPath)"
-            $Result.Status[1..9] | Should -Be @('arg=--homedir', 'arg=.', 'arg=--status-fd', 'arg=1', 'arg=--keyring', 'arg=hashicorp.gpg', 'arg=SHA256SUMS.sig', 'arg=SHA256SUMS')
-        }
-
-        It 'separates stdout status lines from stderr and returns the exit code' {
-            $Result = Invoke-Gpgv -GpgvPath $FakeGpgv -WorkingDirectory $WorkDirectory
-
-            $Result.ExitCode | Should -Be 3
-            $Result.Errors | Should -Be @('gpgv: to stderr')
-            $Result.Status | Should -Not -Contain 'gpgv: to stderr'
-        }
-
-        It 'restores the current location' {
-            $Before = $PWD.Path
-            Invoke-Gpgv -GpgvPath $FakeGpgv -WorkingDirectory $WorkDirectory | Out-Null
-
-            $PWD.Path | Should -Be $Before
-        }
     }
 
     Describe 'Assert-TerraformChecksumsSignature' {
         BeforeAll {
-            $Release = @{
-                ChecksumsUri = 'https://releases.hashicorp.com/terraform/1.9.8/terraform_1.9.8_SHA256SUMS'
-                SignatureUri = 'https://releases.hashicorp.com/terraform/1.9.8/terraform_1.9.8_SHA256SUMS.72D7468F.sig'
+            $Fixtures = Join-Path -Path $PSScriptRoot -ChildPath 'fixtures'
+            $ChecksumsBytes = [System.IO.File]::ReadAllBytes((Join-Path -Path $Fixtures -ChildPath 'terraform_1.9.8_SHA256SUMS'))
+            $SignatureBytes = [System.IO.File]::ReadAllBytes((Join-Path -Path $Fixtures -ChildPath 'terraform_1.9.8_SHA256SUMS.72D7468F.sig'))
+            $OtherReleaseSignatureBytes = [System.IO.File]::ReadAllBytes((Join-Path -Path $Fixtures -ChildPath 'terraform_0.11.15_SHA256SUMS.72D7468F.sig'))
+
+            if (-not ('Org.BouncyCastle.Bcpg.OpenPgp.PgpUtilities' -as [type])) {
+                Add-Type -Path $BouncyCastleAssembly
             }
-            $ChecksumsBytes = [System.Text.Encoding]::UTF8.GetBytes("sums`n")
+        }
 
-            function New-ValidSig([string]$PrimaryFingerprint) {
-                "[GNUPG:] VALIDSIG 374EC75B485913604A831CC7C820C6D5CD27AB87 2024-10-16 1729084074 0 4 0 1 8 00 ${PrimaryFingerprint}"
+        It 'accepts HashiCorp''s genuine signature' {
+            { Assert-TerraformChecksumsSignature -ChecksumsBytes $ChecksumsBytes -SignatureBytes $SignatureBytes -Source 'SHA256SUMS' } | Should -Not -Throw
+        }
+
+        It 'rejects a tampered checksum file' {
+            $Tampered = [byte[]]$ChecksumsBytes.Clone()
+            $Tampered[0] = $Tampered[0] -bxor 0x01
+
+            { Assert-TerraformChecksumsSignature -ChecksumsBytes $Tampered -SignatureBytes $SignatureBytes -Source 'SHA256SUMS' } | Should -Throw 'PGP signature verification failed for SHA256SUMS*'
+        }
+
+        It 'rejects the genuine signature of a different release' {
+            { Assert-TerraformChecksumsSignature -ChecksumsBytes $ChecksumsBytes -SignatureBytes $OtherReleaseSignatureBytes -Source 'SHA256SUMS' } | Should -Throw 'PGP signature verification failed*'
+        }
+
+        It 'rejects <Case>' -TestCases @(
+            @{ Case = 'garbage'; Bytes = [byte[]](1, 2, 3) }
+            @{ Case = 'an empty signature'; Bytes = [byte[]]@() }
+        ) {
+            { Assert-TerraformChecksumsSignature -ChecksumsBytes $ChecksumsBytes -SignatureBytes $Bytes -Source 'SHA256SUMS' } | Should -Throw 'PGP signature verification failed*'
+        }
+
+        It 'rejects a signature whose key is not the pinned HashiCorp key' {
+            $Pinned = $script:HashiCorpKeyFingerprint
+            $script:HashiCorpKeyFingerprint = '0' * 40
+
+            try {
+                { Assert-TerraformChecksumsSignature -ChecksumsBytes $ChecksumsBytes -SignatureBytes $SignatureBytes -Source 'SHA256SUMS' } | Should -Throw 'PGP signature verification failed*'
+            }
+            finally {
+                $script:HashiCorpKeyFingerprint = $Pinned
             }
         }
 
-        BeforeEach {
-            Mock Get-GpgvPath { '/opt/gnupg/bin/gpgv' }
-            Mock Invoke-TerraformReleaseRequest { Set-Content -Path $OutFile -Value 'sig' }
-            Mock Invoke-Gpgv { @{ ExitCode = 0; Status = @('[GNUPG:] GOODSIG C820C6D5CD27AB87 HashiCorp', (New-ValidSig $HashiCorpKeyFingerprint)); Errors = @() } }
-        }
+        It 'bundles the HashiCorp key with the pinned fingerprint' {
+            $KeyStream = [System.IO.File]::OpenRead($HashiCorpKeyFile)
 
-        It 'accepts a valid signature from the pinned HashiCorp key' {
-            { Assert-TerraformChecksumsSignature -Release $Release -ChecksumsBytes $ChecksumsBytes } | Should -Not -Throw
-
-            Should -Invoke Invoke-TerraformReleaseRequest -Exactly -Times 1 -ParameterFilter { $Uri -eq $Release.SignatureUri }
-            Should -Invoke Invoke-Gpgv -Exactly -Times 1 -ParameterFilter { $GpgvPath -eq '/opt/gnupg/bin/gpgv' }
-        }
-
-        It 'gives gpgv only the bundled key, the checksums and the signature in an isolated directory' {
-            Mock Invoke-Gpgv {
-                (Get-ChildItem -Path $WorkingDirectory -Force).Name | Sort-Object | Should -Be @('hashicorp.gpg', 'SHA256SUMS', 'SHA256SUMS.sig')
-                [System.IO.File]::ReadAllBytes((Join-Path -Path $WorkingDirectory -ChildPath 'hashicorp.gpg')) | Should -Be (ConvertFrom-ArmoredPgpKey -Path $HashiCorpKeyFile)
-                [System.IO.File]::ReadAllBytes((Join-Path -Path $WorkingDirectory -ChildPath 'SHA256SUMS')) | Should -Be $ChecksumsBytes
-                Get-Content -Path (Join-Path -Path $WorkingDirectory -ChildPath 'SHA256SUMS.sig') -Raw | Should -Be "sig$([Environment]::NewLine)"
-                @{ ExitCode = 0; Status = @(New-ValidSig $HashiCorpKeyFingerprint); Errors = @() }
+            try {
+                $Keys = [Org.BouncyCastle.Bcpg.OpenPgp.PgpPublicKeyRingBundle]::new([Org.BouncyCastle.Bcpg.OpenPgp.PgpUtilities]::GetDecoderStream($KeyStream))
+            }
+            finally {
+                $KeyStream.Dispose()
             }
 
-            { Assert-TerraformChecksumsSignature -Release $Release -ChecksumsBytes $ChecksumsBytes } | Should -Not -Throw
-        }
-
-        It 'rejects a valid signature from a different key' {
-            Mock Invoke-Gpgv { @{ ExitCode = 0; Status = @(New-ValidSig ('0' * 40)); Errors = @() } }
-
-            { Assert-TerraformChecksumsSignature -Release $Release -ChecksumsBytes $ChecksumsBytes } | Should -Throw '*PGP signature verification failed*'
-        }
-
-        It 'rejects a bad signature' {
-            Mock Invoke-Gpgv { @{ ExitCode = 1; Status = @('[GNUPG:] BADSIG C820C6D5CD27AB87 HashiCorp'); Errors = @('gpgv: BAD signature') } }
-
-            { Assert-TerraformChecksumsSignature -Release $Release -ChecksumsBytes $ChecksumsBytes } | Should -Throw '*PGP signature verification failed*BAD signature*'
-        }
-
-        It 'rejects a non-zero gpgv exit code even with a VALIDSIG line' {
-            Mock Invoke-Gpgv { @{ ExitCode = 2; Status = @(New-ValidSig $HashiCorpKeyFingerprint); Errors = @() } }
-
-            { Assert-TerraformChecksumsSignature -Release $Release -ChecksumsBytes $ChecksumsBytes } | Should -Throw '*PGP signature verification failed*'
-        }
-
-        It 'ignores VALIDSIG text that only appears on stderr' {
-            Mock Invoke-Gpgv { @{ ExitCode = 0; Status = @(); Errors = @(New-ValidSig $HashiCorpKeyFingerprint) } }
-
-            { Assert-TerraformChecksumsSignature -Release $Release -ChecksumsBytes $ChecksumsBytes } | Should -Throw '*PGP signature verification failed*'
-        }
-
-        It 'fails when the signature file cannot be downloaded' {
-            Mock Invoke-TerraformReleaseRequest { throw 'Response status code does not indicate success: 404 (Not Found).' }
-
-            { Assert-TerraformChecksumsSignature -Release $Release -ChecksumsBytes $ChecksumsBytes } | Should -Throw '*404*'
-            Should -Invoke Invoke-Gpgv -Times 0
-        }
-
-        It 'fails when gpgv is not installed' {
-            Mock Get-GpgvPath { $null }
-
-            { Assert-TerraformChecksumsSignature -Release $Release -ChecksumsBytes $ChecksumsBytes } | Should -Throw '*gpgv is required*'
-            Should -Invoke Invoke-TerraformReleaseRequest -Times 0
+            $Fingerprints = @($Keys.GetKeyRings() | ForEach-Object { [System.Convert]::ToHexString($_.GetPublicKey().GetFingerprint()) })
+            $Fingerprints | Should -Be @($HashiCorpKeyFingerprint)
+            $HashiCorpKeyFingerprint | Should -BeLike "*${HashiCorpKeyId}"
         }
     }
 
     Describe 'Get-TerraformCachedBinaryStatus' {
         BeforeEach {
-            Reset-TerraformBinaryVerificationCache
+            $script:VerifiedBinaries = @{}
             $Directory = Join-Path -Path $TestDrive -ChildPath ([guid]::NewGuid())
             New-Item -Path $Directory -ItemType Directory | Out-Null
             $Binary = Join-Path -Path $Directory -ChildPath 'terraform'
@@ -466,26 +250,25 @@ InModuleScope terraposh {
         }
 
         It 'is Valid when the binary matches the recorded hash' {
-            Set-Content -Path $Marker -Value "$('a' * 64)`nsignature=Verified`nbinary=${BinaryHash}" -NoNewline
+            Set-Content -Path $Marker -Value $BinaryHash -NoNewline
 
             Get-TerraformCachedBinaryStatus -BinaryFile $Binary -VerifiedFile $Marker | Should -Be 'Valid'
         }
 
         It 'is Modified when the binary no longer matches the recorded hash' {
-            Set-Content -Path $Marker -Value "$('a' * 64)`nsignature=Verified`nbinary=${BinaryHash}" -NoNewline
+            Set-Content -Path $Marker -Value $BinaryHash -NoNewline
             Set-Content -Path $Binary -Value 'tampered' -NoNewline
 
             Get-TerraformCachedBinaryStatus -BinaryFile $Binary -VerifiedFile $Marker | Should -Be 'Modified'
         }
 
         It 'is Missing for <Case>' -TestCases @(
-            @{ Case = 'a hash-only marker from before signature checks'; Content = ('a' * 64) }
-            @{ Case = 'a marker without a binary hash'; Content = "$('a' * 64)`nsignature=Verified" }
-            @{ Case = 'an unverified signature'; Content = "$('a' * 64)`nsignature=Unverified`nbinary=BINARY" }
-            @{ Case = 'signatures turned off'; Content = "$('a' * 64)`nsignature=Off`nbinary=BINARY" }
-            @{ Case = 'a malformed binary hash'; Content = "$('a' * 64)`nsignature=Verified`nbinary=xyz" }
+            @{ Case = 'an older multi-line marker'; Content = "$('a' * 64)`nsignature=Verified`nbinary=BINARY" }
+            @{ Case = 'a malformed hash'; Content = 'xyz' }
+            @{ Case = 'an uppercase hash'; Content = 'UPPER' }
+            @{ Case = 'an empty marker'; Content = '' }
         ) {
-            Set-Content -Path $Marker -Value ($Content -replace 'BINARY', $BinaryHash) -NoNewline
+            Set-Content -Path $Marker -Value ($Content -replace 'BINARY', $BinaryHash -replace 'UPPER', $BinaryHash.ToUpper()) -NoNewline
 
             Get-TerraformCachedBinaryStatus -BinaryFile $Binary -VerifiedFile $Marker | Should -Be 'Missing'
         }
@@ -493,54 +276,19 @@ InModuleScope terraposh {
         It 'is Missing without a marker or without a binary' {
             Get-TerraformCachedBinaryStatus -BinaryFile $Binary -VerifiedFile $Marker | Should -Be 'Missing'
 
-            Set-Content -Path $Marker -Value "$('a' * 64)`nsignature=Verified`nbinary=${BinaryHash}" -NoNewline
+            Set-Content -Path $Marker -Value $BinaryHash -NoNewline
             Remove-Item -Path $Binary
             Get-TerraformCachedBinaryStatus -BinaryFile $Binary -VerifiedFile $Marker | Should -Be 'Missing'
         }
 
         It 'hashes a binary only once until the cache is reset' {
-            Set-Content -Path $Marker -Value "$('a' * 64)`nsignature=Verified`nbinary=${BinaryHash}" -NoNewline
+            Set-Content -Path $Marker -Value $BinaryHash -NoNewline
             Get-TerraformCachedBinaryStatus -BinaryFile $Binary -VerifiedFile $Marker | Should -Be 'Valid'
             Set-Content -Path $Binary -Value 'tampered' -NoNewline
 
             Get-TerraformCachedBinaryStatus -BinaryFile $Binary -VerifiedFile $Marker | Should -Be 'Valid'
-            Reset-TerraformBinaryVerificationCache
+            $script:VerifiedBinaries = @{}
             Get-TerraformCachedBinaryStatus -BinaryFile $Binary -VerifiedFile $Marker | Should -Be 'Modified'
-        }
-    }
-
-    Describe 'Test-LockContention' {
-        It 'treats HResult <HResult> on <OS> as contention: <Expected>' -TestCases @(
-            @{ OS = 'linux'; HResult = 11; Expected = $true }
-            @{ OS = 'darwin'; HResult = 35; Expected = $true }
-            @{ OS = 'windows'; HResult = -2147024864; Expected = $true }
-            @{ OS = 'windows'; HResult = -2147024863; Expected = $true }
-            @{ OS = 'linux'; HResult = 28; Expected = $false }
-            @{ OS = 'windows'; HResult = 11; Expected = $false }
-        ) {
-            Mock Get-TerraformOS { $OS }
-            $Exception = [System.IO.IOException]::new('io', $HResult)
-
-            Test-LockContention -Exception $Exception | Should -Be $Expected
-        }
-
-        It 'does not treat IOException subclasses as contention' {
-            Test-LockContention -Exception ([System.IO.DirectoryNotFoundException]::new('missing')) | Should -BeFalse
-            Test-LockContention -Exception ([System.IO.FileNotFoundException]::new('missing')) | Should -BeFalse
-        }
-
-        It 'unwraps method invocation errors' {
-            $Lock = Join-Path -Path $TestDrive -ChildPath "$([guid]::NewGuid()).lock"
-            $Held = [System.IO.File]::Open($Lock, 'OpenOrCreate', 'ReadWrite', 'None')
-
-            try {
-                try { [System.IO.File]::Open($Lock, 'OpenOrCreate', 'ReadWrite', 'None') } catch { $Caught = $_.Exception }
-                $Caught | Should -BeOfType [System.Management.Automation.MethodInvocationException]
-                Test-LockContention -Exception $Caught | Should -BeTrue
-            }
-            finally {
-                $Held.Dispose()
-            }
         }
     }
 
@@ -604,19 +352,12 @@ InModuleScope terraposh {
         }
     }
 
-    Describe 'Test-FileChecksum' {
-        BeforeAll {
+    Describe 'Get-FileSha256' {
+        It 'returns the lowercase SHA-256 of a file' {
             $File = Join-Path -Path $TestDrive -ChildPath 'file.txt'
             Set-Content -Path $File -Value 'terraposh' -NoNewline
-            $Hash = (Get-FileHash -Path $File -Algorithm SHA256).Hash.ToLower()
-        }
 
-        It 'returns true for a matching hash' {
-            Test-FileChecksum -Path $File -ExpectedHash $Hash | Should -BeTrue
-        }
-
-        It 'returns false for a different hash' {
-            Test-FileChecksum -Path $File -ExpectedHash ('0' * 64) | Should -BeFalse
+            Get-FileSha256 -Path $File | Should -BeExactly 'f5c00f445df8e43bb50f7816a6658bedbc21590bc07cf829b632fa5e4d83fda8'
         }
     }
 
@@ -637,7 +378,7 @@ InModuleScope terraposh {
                 $Binary = Join-Path -Path $Directory -ChildPath $BinaryFileName
                 Set-Content -Path $Binary -Value $Content -NoNewline
                 $Hash = (Get-FileHash -Path $Binary -Algorithm SHA256).Hash.ToLower()
-                Set-Content -Path (Join-Path -Path $Directory -ChildPath $MarkerName) -Value "${FakeHash}`nsignature=Verified`nbinary=${Hash}" -NoNewline
+                Set-Content -Path (Join-Path -Path $Directory -ChildPath $MarkerName) -Value $Hash -NoNewline
                 return $Binary
             }
 
@@ -647,7 +388,7 @@ InModuleScope terraposh {
         }
 
         BeforeEach {
-            Reset-TerraformBinaryVerificationCache
+            $script:VerifiedBinaries = @{}
             $VendoredDirectory = Join-Path -Path $TestDrive -ChildPath 'vendored'
             Remove-Item -Path $VendoredDirectory -Recurse -Force -ErrorAction Ignore
             New-Item -Path $VendoredDirectory -ItemType Directory | Out-Null
@@ -660,7 +401,6 @@ InModuleScope terraposh {
             Mock Set-TerraformVendoredDirectory { Join-Path -Path $TestDrive -ChildPath 'vendored' }
             Mock Get-TerraformOS { 'darwin' }
             Mock Get-TerraformArchitecture { 'arm64' }
-            Mock Get-TerraformFallbackArchitecture { 'amd64' }
             Mock Write-Warning {}
             Mock Get-TerraformReleaseChecksums { $script:PublishedChecksums }
             Mock Invoke-TerraformReleaseRequest { Copy-Item -Path $FakeArchive -Destination $OutFile }
@@ -671,8 +411,7 @@ InModuleScope terraposh {
 
             $Binary | Should -Be (Get-VendoredPath "terraform_1.9.8_darwin_arm64/${BinaryFileName}")
             Get-Content -Path $Binary -Raw | Should -Be 'genuine terraform'
-            Get-Content -Path (Get-VendoredPath 'terraform_1.9.8_darwin_arm64/.terraposh-sha256') -Force | Should -Be @($FakeHash, 'signature=Verified', "binary=${GenuineBinaryHash}")
-            Test-Path -Path (Get-VendoredPath 'terraform_1.9.8_darwin_arm64.zip.download') | Should -BeFalse
+            Get-Content -Path (Get-VendoredPath 'terraform_1.9.8_darwin_arm64/.terraposh-sha256') -Force | Should -Be $GenuineBinaryHash
             Should -Invoke Invoke-TerraformReleaseRequest -Exactly -Times 1 -ParameterFilter {
                 $Uri -eq 'https://releases.hashicorp.com/terraform/1.9.8/terraform_1.9.8_darwin_arm64.zip'
             }
@@ -702,7 +441,7 @@ InModuleScope terraposh {
             $Binary = Get-TerraformBinary -Version '1.9.8'
 
             Get-Content -Path $Binary -Raw | Should -Be 'genuine terraform'
-            Test-FileChecksum -Path (Get-VendoredPath 'terraform_1.9.8_darwin_arm64.zip') -ExpectedHash $FakeHash | Should -BeTrue
+            Get-FileSha256 -Path (Get-VendoredPath 'terraform_1.9.8_darwin_arm64.zip') | Should -Be $FakeHash
             Should -Invoke Write-Warning -Exactly -Times 1 -ParameterFilter { $Message -like '*failed SHA-256 verification*' }
             Should -Invoke Invoke-TerraformReleaseRequest -Exactly -Times 1
         }
@@ -728,9 +467,9 @@ InModuleScope terraposh {
 
         It 'throws when the checksum file has no entry for the build' {
             $script:PublishedChecksums = @{ 'terraform_1.9.8_linux_amd64.zip' = $FakeHash }
-            Mock Get-TerraformFallbackArchitecture { $null }
+            Mock Get-TerraformOS { 'linux' }
 
-            { Get-TerraformBinary -Version '1.9.8' } | Should -Throw '*no published build for darwin_arm64*'
+            { Get-TerraformBinary -Version '1.9.8' } | Should -Throw '*no published build for linux_arm64*'
             Should -Invoke Invoke-TerraformReleaseRequest -Times 0
         }
 
@@ -747,7 +486,7 @@ InModuleScope terraposh {
                 @{ Case = 'before signature checks existed'; Content = 'HASH' }
                 @{ Case = 'with an Unverified signature'; Content = "HASH`nsignature=Unverified" }
                 @{ Case = 'with signatures Off'; Content = "HASH`nsignature=Off" }
-                @{ Case = 'without a binary hash'; Content = "HASH`nsignature=Verified" }
+                @{ Case = 'with the previous three-line marker'; Content = "HASH`nsignature=Verified`nbinary=HASH" }
             ) {
                 $Directory = Get-VendoredPath 'terraform_1.9.8_darwin_arm64'
                 New-Item -Path $Directory -ItemType Directory | Out-Null
@@ -756,7 +495,7 @@ InModuleScope terraposh {
 
                 Get-Content -Path (Get-TerraformBinary -Version '1.9.8') -Raw | Should -Be 'genuine terraform'
                 Should -Invoke Get-TerraformReleaseChecksums -Exactly -Times 1
-                Get-Content -Path (Get-VendoredPath 'terraform_1.9.8_darwin_arm64/.terraposh-sha256') -Force | Should -Be @($FakeHash, 'signature=Verified', "binary=${GenuineBinaryHash}")
+                Get-Content -Path (Get-VendoredPath 'terraform_1.9.8_darwin_arm64/.terraposh-sha256') -Force | Should -Be $GenuineBinaryHash
             }
         }
 
@@ -776,7 +515,7 @@ InModuleScope terraposh {
                 Get-Content -Path (Get-TerraformBinary -Version '1.9.8') -Raw | Should -Be 'genuine terraform'
                 Should -Invoke Write-Warning -Exactly -Times 1 -ParameterFilter { $Message -like 'Cached Terraform binary failed SHA-256 verification*' }
                 Should -Invoke Invoke-TerraformReleaseRequest -Times 0
-                Get-Content -Path (Get-VendoredPath 'terraform_1.9.8_darwin_arm64/.terraposh-sha256') -Force | Should -Be @($FakeHash, 'signature=Verified', "binary=${GenuineBinaryHash}")
+                Get-Content -Path (Get-VendoredPath 'terraform_1.9.8_darwin_arm64/.terraposh-sha256') -Force | Should -Be $GenuineBinaryHash
             }
 
             It 'hashes the cached binary once per command' {
@@ -787,7 +526,7 @@ InModuleScope terraposh {
                 Get-TerraformBinary -Version '1.9.8' | Should -Be $Binary
                 Should -Invoke Write-Warning -Times 0
 
-                Reset-TerraformBinaryVerificationCache
+                $script:VerifiedBinaries = @{}
                 Get-Content -Path (Get-TerraformBinary -Version '1.9.8') -Raw | Should -Be 'genuine terraform'
                 Should -Invoke Write-Warning -Exactly -Times 1 -ParameterFilter { $Message -like 'Cached Terraform binary failed SHA-256 verification*' }
             }
@@ -909,75 +648,42 @@ InModuleScope terraposh {
 
     Describe 'Invoke-Terraposh' {
         It 'starts each command with a fresh binary verification cache' {
-            Mock Reset-TerraformBinaryVerificationCache {}
+            $script:VerifiedBinaries = @{ 'stale' = 'a' * 64 }
             Mock Get-Config { @{ TerraformVersion = '1.9.8' } }
             Mock Get-TerraformBinary { 'terraform' }
             Mock Invoke-Expression { $global:LASTEXITCODE = 0 }
 
             Invoke-Terraposh -TerraformCommand 'version' -Explicit
 
-            Should -Invoke Reset-TerraformBinaryVerificationCache -Exactly -Times 1
+            $script:VerifiedBinaries.Count | Should -Be 0
         }
     }
 
-    Describe 'Signature verification against releases.hashicorp.com' -Tag 'Integration' {
-        $RunIntegration = [bool](Get-GpgvPath) -or $env:CI -eq 'true'
-
+    Describe 'Get-TerraformBinary against releases.hashicorp.com' -Tag 'Integration' {
         BeforeAll {
             Mock Set-TerraformVendoredDirectory {
                 $Directory = Join-Path -Path $TestDrive -ChildPath 'vendored'
                 New-Item -Path $Directory -ItemType Directory -Force | Out-Null
                 return $Directory
             }
-
-            $OS = Get-TerraformOS
-            $Release = Get-TerraformRelease -Version '1.9.8'
         }
 
-        It 'downloads, verifies and runs Terraform <Version> for this platform' -Skip:(-not $RunIntegration) -TestCases @(
+        It 'downloads, verifies and runs Terraform <Version> for this platform' -TestCases @(
             @{ Version = '1.9.8' }
         ) {
             $Binary = Get-TerraformBinary -Version $Version
-
-            Test-Path -Path $Binary | Should -BeTrue
-            Get-Content -Path (Join-Path -Path (Split-Path -Parent $Binary) -ChildPath '.terraposh-sha256*') -Force | Should -Contain 'signature=Verified'
-
+            $OS = Get-TerraformOS
             $Platform = (Split-Path -Leaf (Split-Path -Parent $Binary)) -replace "^terraform_${Version}_", ''
+
             $ExpectedPlatforms = @("${OS}_$(Get-TerraformArchitecture)")
-            $FallbackArchitecture = Get-TerraformFallbackArchitecture
-            if ($FallbackArchitecture) { $ExpectedPlatforms += "${OS}_${FallbackArchitecture}" }
+            if ((Get-TerraformArchitecture) -eq 'arm64' -and $OS -in @('darwin', 'windows')) { $ExpectedPlatforms += "${OS}_amd64" }
             $Platform | Should -BeIn $ExpectedPlatforms
+            Get-Content -Path (Join-Path -Path (Split-Path -Parent $Binary) -ChildPath '.terraposh-sha256*') -Force | Should -Be (Get-FileSha256 -Path $Binary)
 
             $Output = & $Binary version
             $LASTEXITCODE | Should -Be 0
             $Output[0] | Should -Be "Terraform v${Version}"
             $Output[1] | Should -Be "on ${Platform}"
-        }
-
-        Context 'gpgv' -Skip:(-not $RunIntegration) {
-            BeforeAll {
-                $ChecksumsFile = Join-Path -Path $TestDrive -ChildPath 'SHA256SUMS'
-                Invoke-TerraformReleaseRequest -Uri $Release.ChecksumsUri -OutFile $ChecksumsFile
-                $ChecksumsBytes = [System.IO.File]::ReadAllBytes($ChecksumsFile)
-            }
-
-            It 'verifies the real SHA256SUMS signature with gpgv' {
-                { Assert-TerraformChecksumsSignature -Release $Release -ChecksumsBytes $ChecksumsBytes } | Should -Not -Throw
-            }
-
-            It 'rejects a tampered SHA256SUMS' {
-                $TamperedBytes = [byte[]]$ChecksumsBytes.Clone()
-                $TamperedBytes[0] = $TamperedBytes[0] -bxor 0x01
-
-                { Assert-TerraformChecksumsSignature -Release $Release -ChecksumsBytes $TamperedBytes } | Should -Throw '*PGP signature verification failed*'
-            }
-
-            It 'rejects the real signature of a different release' {
-                $OtherRelease = $Release.Clone()
-                $OtherRelease.SignatureUri = $Release.SignatureUri -replace '1\.9\.8', '1.9.7'
-
-                { Assert-TerraformChecksumsSignature -Release $OtherRelease -ChecksumsBytes $ChecksumsBytes } | Should -Throw '*PGP signature verification failed*'
-            }
         }
     }
 }

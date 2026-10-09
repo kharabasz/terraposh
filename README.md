@@ -67,21 +67,15 @@ Downloads are only made over HTTPS from HashiCorp's official release server (`ht
 
 ### Signature verification
 
-On top of the checksum check, terraposh verifies that the release really comes from HashiCorp. Before any checksum is trusted, `terraform_<version>_SHA256SUMS` is verified with `gpgv` against HashiCorp's release key. The key is bundled as `hashicorp.asc` (fingerprint `C874 011F 0AB4 0511 0D02  1055 3436 5D94 72D7 468F`). The signed checksum file names every archive by version, OS and architecture, so a verified checksum proves the exact build.
+On top of the checksum check, terraposh verifies that the release really comes from HashiCorp. Before any checksum is trusted, `terraform_<version>_SHA256SUMS` is checked against its detached signature using HashiCorp's release key, bundled as `hashicorp.asc` (fingerprint `C874 011F 0AB4 0511 0D02  1055 3436 5D94 72D7 468F`). The signed checksum file names every archive by version, OS and architecture, so a verified checksum proves the exact build.
 
-Verification always runs and can't be turned off. The command fails if the signature is invalid, from anyone other than HashiCorp, or can't be checked because `gpgv` is missing. `gpgv` comes with GnuPG:
-
-| OS | Install |
-|---|---|
-| Linux | Preinstalled on most distributions; otherwise the `gpgv` or `gnupg` package |
-| macOS | `brew install gnupg` |
-| Windows | [Gpg4win](https://gpg4win.org) or [Git for Windows](https://gitforwindows.org). If `gpgv` isn't on `PATH`, terraposh looks next to the `git` on `PATH`, then in the usual Git for Windows locations (Program Files, a per-user install under `%LOCALAPPDATA%\Programs\Git`, Scoop) and Gpg4win's `GnuPG\bin` |
+Verification always runs and can't be turned off; the command fails if the signature is invalid or from anyone other than HashiCorp. It needs nothing installed: the OpenPGP check uses [Bouncy Castle](https://www.bouncycastle.org/) (`BouncyCastle.Cryptography` 2.6.2, MIT licensed), bundled in `lib/` from the [NuGet package](https://www.nuget.org/packages/BouncyCastle.Cryptography/2.6.2).
 
 The build matching your OS and CPU architecture is used. On Arm64 macOS and Windows, if a version has no native build (e.g. Terraform < 1.0.2 on Apple Silicon), the `amd64` build is used under emulation (Rosetta 2 on macOS) and a warning is shown.
 
 ## Running tests
 
-Tests use [Pester](https://pester.dev) and run in GitHub Actions on Linux and Windows (amd64 and arm64) and macOS (Apple Silicon). The integration tests need `gpgv` and are skipped locally without it. To run them locally:
+Tests use [Pester](https://pester.dev) and run in GitHub Actions on Linux and Windows (amd64 and arm64) and macOS (Apple Silicon). To run them locally:
 
 ```powershell
 Install-Module -Name Pester -RequiredVersion 6.2.0 -Scope CurrentUser

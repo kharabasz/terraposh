@@ -14,8 +14,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Cached Terraform binaries are checked against the SHA-256 recorded when they were extracted, once per terraposh command; a binary that changed is re-extracted from the verified archive
 - Fixed the wrong architecture being downloaded on macOS/Linux (e.g. `amd64` on Apple Silicon); architecture is now detected from the OS on all platforms
 - On Arm64 macOS and Windows, versions with no native build (e.g. Terraform < 1.0.2 on Apple Silicon) fall back to the `amd64` build under emulation, with a warning
-- Added signature verification of Terraform releases: `terraform_<version>_SHA256SUMS` is verified with `gpgv` against HashiCorp's bundled release key on every OS
-- Signature verification always runs: a missing `gpgv` fails the command (on Windows, if `gpgv` isn't on `PATH`, Git for Windows' or Gpg4win's `gpgv.exe` is found next to `git` or in their usual install locations)
+- Added signature verification of Terraform releases: `terraform_<version>_SHA256SUMS` is verified against HashiCorp's bundled release key on every OS, using a bundled copy of Bouncy Castle (`lib/BouncyCastle.Cryptography.dll` 2.6.2), so nothing extra needs installing
+- Signature verification always runs and can't be turned off
 - PowerShell 7.2 or later is now required
 - Concurrent terraposh runs no longer interfere when downloading the same Terraform build; downloads and extraction are serialised per build with a lock file
 - Added Pester tests and a GitHub Actions workflow running them on Linux, Windows and macOS

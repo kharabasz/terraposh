@@ -21,7 +21,7 @@ function Invoke-Terraposh {
         [switch]$SkipWorkspace
     )
 
-    Reset-TerraformBinaryVerificationCache
+    $script:VerifiedBinaries = @{}
 
     # Push to directory
     if (-not [string]::IsNullOrWhiteSpace($Directory)) {
@@ -357,19 +357,6 @@ function Get-TerraformArchitecture {
     }
 }
 
-function Get-TerraformFallbackArchitecture {
-    param (
-        [string]$OS = (Get-TerraformOS),
-        [string]$Architecture = (Get-TerraformArchitecture)
-    )
-
-    if ($Architecture -eq 'arm64' -and $OS -in @('darwin', 'windows')) {
-        return 'amd64'
-    }
-
-    return $null
-}
-
 function Get-TerraformRelease {
     param (
         [string]$Version,
@@ -423,159 +410,62 @@ function Invoke-TerraformReleaseRequest {
         throw "Refusing to download from untrusted location: ${Uri}"
     }
 
-    Invoke-WebRequest -Method Get -Uri $ParsedUri -MaximumRedirection 0 -OutFile $OutFile | Out-Null
-}
+    if (-not [string]::IsNullOrWhiteSpace($OutFile)) {
+        Invoke-WebRequest -Method Get -Uri $ParsedUri -MaximumRedirection 0 -OutFile $OutFile | Out-Null
+        return
+    }
 
-function New-TerraposhTemporaryDirectory {
-    $Directory = Join-Path -Path ([System.IO.Path]::GetTempPath()) -ChildPath "terraposh-$([guid]::NewGuid().ToString('N'))"
-    New-Item -Path $Directory -ItemType Directory | Out-Null
-
-    return $Directory
+    return , (Invoke-WebRequest -Method Get -Uri $ParsedUri -MaximumRedirection 0).RawContentStream.ToArray()
 }
 
 $HashiCorpKeyFile = Join-Path -Path $PSScriptRoot -ChildPath 'hashicorp.asc'
 $HashiCorpKeyFingerprint = 'C874011F0AB405110D02105534365D9472D7468F'
 $HashiCorpKeyId = '72D7468F'
-
-function ConvertFrom-ArmoredPgpKey {
-    param (
-        [string]$Path
-    )
-
-    $Base64 = [System.Text.StringBuilder]::new()
-    $InHeaders = $false
-    $InBody = $false
-
-    foreach ($Line in (Get-Content -Path $Path)) {
-        $Line = $Line.Trim()
-
-        if ($Line -eq '-----BEGIN PGP PUBLIC KEY BLOCK-----') {
-            $InHeaders = $true
-            continue
-        }
-
-        if ($Line -eq '-----END PGP PUBLIC KEY BLOCK-----') {
-            break
-        }
-
-        if ($InHeaders) {
-            $InHeaders = $Line -ne ''
-            $InBody = -not $InHeaders
-            continue
-        }
-
-        if ($InBody -and -not $Line.StartsWith('=')) {
-            $Base64.Append($Line) | Out-Null
-        }
-    }
-
-    if ($Base64.Length -eq 0) {
-        throw "No PGP public key block found in ${Path}"
-    }
-
-    return [System.Convert]::FromBase64String($Base64.ToString())
-}
-
-function Get-GpgvPath {
-    $Command = Get-Command -Name 'gpgv' -CommandType Application -ErrorAction Ignore | Select-Object -First 1
-
-    if ($Command) {
-        return $Command.Source
-    }
-
-    if ((Get-TerraformOS) -ne 'windows') {
-        return $null
-    }
-
-    $Candidates = [ArrayList]::new()
-    $Git = Get-Command -Name 'git' -CommandType Application -ErrorAction Ignore | Select-Object -First 1
-
-    if ($Git) {
-        $Directory = Split-Path -Parent $Git.Source
-
-        for ($Level = 0; $Level -lt 3 -and -not [string]::IsNullOrWhiteSpace($Directory); $Level++) {
-            $Candidates.Add((Join-Path -Path $Directory -ChildPath 'usr' -AdditionalChildPath 'bin', 'gpgv.exe')) | Out-Null
-            $Directory = Split-Path -Parent $Directory
-        }
-    }
-
-    $ScoopRoot = [string]::IsNullOrWhiteSpace($env:SCOOP) ? ([string]::IsNullOrWhiteSpace($env:USERPROFILE) ? $null : (Join-Path -Path $env:USERPROFILE -ChildPath 'scoop')) : $env:SCOOP
-    $GitRoots = @(
-        $env:ProgramW6432 ? (Join-Path -Path $env:ProgramW6432 -ChildPath 'Git') : $null
-        $env:ProgramFiles ? (Join-Path -Path $env:ProgramFiles -ChildPath 'Git') : $null
-        ${env:ProgramFiles(x86)} ? (Join-Path -Path ${env:ProgramFiles(x86)} -ChildPath 'Git') : $null
-        $env:LOCALAPPDATA ? (Join-Path -Path $env:LOCALAPPDATA -ChildPath 'Programs' -AdditionalChildPath 'Git') : $null
-        $ScoopRoot ? (Join-Path -Path $ScoopRoot -ChildPath 'apps' -AdditionalChildPath 'git', 'current') : $null
-    )
-
-    foreach ($GitRoot in ($GitRoots | Where-Object { $_ })) {
-        $Candidates.Add((Join-Path -Path $GitRoot -ChildPath 'usr' -AdditionalChildPath 'bin', 'gpgv.exe')) | Out-Null
-    }
-
-    foreach ($ProgramFiles in (@(${env:ProgramFiles(x86)}, $env:ProgramW6432, $env:ProgramFiles) | Where-Object { $_ })) {
-        $Candidates.Add((Join-Path -Path $ProgramFiles -ChildPath 'GnuPG' -AdditionalChildPath 'bin', 'gpgv.exe')) | Out-Null
-    }
-
-    return $Candidates | Where-Object { Test-Path -Path $_ -PathType Leaf } | Select-Object -First 1
-}
-
-function Invoke-Gpgv {
-    param (
-        [string]$GpgvPath,
-        [string]$WorkingDirectory
-    )
-
-    Push-Location -Path $WorkingDirectory
-
-    try {
-        $Output = & $GpgvPath --homedir . --status-fd 1 --keyring hashicorp.gpg SHA256SUMS.sig SHA256SUMS 2>&1
-        $ExitCode = $LASTEXITCODE
-    }
-    finally {
-        Pop-Location
-    }
-
-    return @{
-        ExitCode = $ExitCode
-        Status   = @($Output | Where-Object { $_ -is [string] })
-        Errors   = @($Output | Where-Object { $_ -is [ErrorRecord] } | ForEach-Object { "$_" })
-    }
-}
+$BouncyCastleAssembly = Join-Path -Path $PSScriptRoot -ChildPath 'lib' -AdditionalChildPath 'BouncyCastle.Cryptography.dll'
 
 function Assert-TerraformChecksumsSignature {
     param (
-        [hashtable]$Release,
-        [byte[]]$ChecksumsBytes
+        [byte[]]$ChecksumsBytes,
+        [byte[]]$SignatureBytes,
+        [string]$Source
     )
 
-    $GpgvPath = Get-GpgvPath
-
-    if (-not $GpgvPath) {
-        throw 'gpgv is required to verify HashiCorp''s signature on Terraform releases. Install GnuPG: brew install gnupg (macOS), Gpg4win or Git for Windows (Windows), or the gpgv or gnupg package (Linux).'
+    if (-not ('Org.BouncyCastle.Bcpg.OpenPgp.PgpUtilities' -as [type])) {
+        Add-Type -Path $BouncyCastleAssembly
     }
-
-    $WorkDirectory = New-TerraposhTemporaryDirectory
 
     try {
-        [System.IO.File]::WriteAllBytes((Join-Path -Path $WorkDirectory -ChildPath 'hashicorp.gpg'), (ConvertFrom-ArmoredPgpKey -Path $HashiCorpKeyFile))
-        [System.IO.File]::WriteAllBytes((Join-Path -Path $WorkDirectory -ChildPath 'SHA256SUMS'), $ChecksumsBytes)
-        Invoke-TerraformReleaseRequest -Uri $Release.SignatureUri -OutFile (Join-Path -Path $WorkDirectory -ChildPath 'SHA256SUMS.sig')
-        $Result = Invoke-Gpgv -GpgvPath $GpgvPath -WorkingDirectory $WorkDirectory
+        $KeyStream = [System.IO.File]::OpenRead($HashiCorpKeyFile)
+
+        try {
+            $Keys = [Org.BouncyCastle.Bcpg.OpenPgp.PgpPublicKeyRingBundle]::new([Org.BouncyCastle.Bcpg.OpenPgp.PgpUtilities]::GetDecoderStream($KeyStream))
+        }
+        finally {
+            $KeyStream.Dispose()
+        }
+
+        $SignatureStream = [Org.BouncyCastle.Bcpg.OpenPgp.PgpUtilities]::GetDecoderStream([System.IO.MemoryStream]::new($SignatureBytes))
+        $Signatures = [Org.BouncyCastle.Bcpg.OpenPgp.PgpObjectFactory]::new($SignatureStream).NextPgpObject()
+        $Signature = $Signatures -is [Org.BouncyCastle.Bcpg.OpenPgp.PgpSignatureList] -and $Signatures.Count -eq 1 ? $Signatures[0] : $null
+        $Key = $Signature ? $Keys.GetPublicKey($Signature.KeyId) : $null
+        $Valid = $false
+
+        if ($Key) {
+            $PrimaryKey = $Keys.GetPublicKeyRing($Signature.KeyId).GetPublicKey()
+            $Signature.InitVerify($Key)
+            $Signature.Update($ChecksumsBytes)
+            $Valid = [System.Convert]::ToHexString($PrimaryKey.GetFingerprint()) -ceq $HashiCorpKeyFingerprint -and $Signature.Verify()
+        }
     }
-    finally {
-        Remove-Item -Path $WorkDirectory -Recurse -Force -ErrorAction Ignore
+    catch {
+        $Valid = $false
     }
 
-    $ValidSignature = $Result.Status | Where-Object {
-        $Fields = $_ -split ' '
-        $Fields[0] -ceq '[GNUPG:]' -and $Fields[1] -ceq 'VALIDSIG' -and $Fields[-1] -ceq $HashiCorpKeyFingerprint
+    if (-not $Valid) {
+        throw "PGP signature verification failed for ${Source}, refusing to use it."
     }
 
-    if ($Result.ExitCode -ne 0 -or -not $ValidSignature) {
-        throw "PGP signature verification failed for $($Release.ChecksumsUri), refusing to use it.`n$($Result.Errors -join "`n")"
-    }
-
-    Write-Verbose -Message "Verified $($Release.ChecksumsUri) is signed by ${HashiCorpKeyFingerprint}"
+    Write-Verbose -Message "Verified ${Source} is signed by ${HashiCorpKeyFingerprint}"
 }
 
 function Get-TerraformReleaseChecksums {
@@ -583,24 +473,13 @@ function Get-TerraformReleaseChecksums {
         [hashtable]$Release
     )
 
-    $WorkDirectory = New-TerraposhTemporaryDirectory
-
-    try {
-        $ChecksumsFile = Join-Path -Path $WorkDirectory -ChildPath 'SHA256SUMS'
-        Invoke-TerraformReleaseRequest -Uri $Release.ChecksumsUri -OutFile $ChecksumsFile
-        $ChecksumsBytes = [System.IO.File]::ReadAllBytes($ChecksumsFile)
-    }
-    finally {
-        Remove-Item -Path $WorkDirectory -Recurse -Force -ErrorAction Ignore
-    }
-
-    Assert-TerraformChecksumsSignature -Release $Release -ChecksumsBytes $ChecksumsBytes
-
-    $Content = [System.Text.Encoding]::UTF8.GetString($ChecksumsBytes)
+    $ChecksumsBytes = Invoke-TerraformReleaseRequest -Uri $Release.ChecksumsUri
+    $SignatureBytes = Invoke-TerraformReleaseRequest -Uri $Release.SignatureUri
+    Assert-TerraformChecksumsSignature -ChecksumsBytes $ChecksumsBytes -SignatureBytes $SignatureBytes -Source $Release.ChecksumsUri
 
     $Checksums = @{}
 
-    foreach ($Line in ($Content -split "`n")) {
+    foreach ($Line in ([System.Text.Encoding]::UTF8.GetString($ChecksumsBytes) -split "`n")) {
         $Hash, $FileName = $Line.Trim() -split '\s+', 2
 
         if ([string]::IsNullOrWhiteSpace($FileName)) {
@@ -617,24 +496,6 @@ function Get-TerraformReleaseChecksums {
     return $Checksums
 }
 
-function Test-FileChecksum {
-    param (
-        [string]$Path,
-        [string]$ExpectedHash
-    )
-
-    $ActualHash = (Get-FileHash -Path $Path -Algorithm SHA256).Hash.ToLower()
-    Write-Verbose -Message "SHA-256 ${Path}: ${ActualHash} (expected ${ExpectedHash})"
-
-    return $ActualHash -ceq $ExpectedHash
-}
-
-$VerifiedBinaries = @{}
-
-function Reset-TerraformBinaryVerificationCache {
-    $script:VerifiedBinaries = @{}
-}
-
 function Get-FileSha256 {
     param (
         [string]$Path
@@ -642,6 +503,8 @@ function Get-FileSha256 {
 
     return (Get-FileHash -Path $Path -Algorithm SHA256).Hash.ToLower()
 }
+
+$VerifiedBinaries = @{}
 
 function Get-TerraformCachedBinaryStatus {
     param (
@@ -653,10 +516,9 @@ function Get-TerraformCachedBinaryStatus {
         return 'Missing'
     }
 
-    $Marker = @(Get-Content -Path $VerifiedFile -Force)
-    $BinaryHash = ($Marker | Where-Object { $_ -cmatch '^binary=[0-9a-f]{64}$' } | Select-Object -First 1) -replace '^binary=', ''
+    $BinaryHash = "$(Get-Content -Path $VerifiedFile -Raw -Force)".Trim()
 
-    if (-not ($Marker -ccontains 'signature=Verified') -or [string]::IsNullOrEmpty($BinaryHash)) {
+    if ($BinaryHash -cnotmatch '^[0-9a-f]{64}$') {
         return 'Missing'
     }
 
@@ -673,26 +535,6 @@ function Get-TerraformCachedBinaryStatus {
     return 'Valid'
 }
 
-function Test-LockContention {
-    param (
-        [System.Exception]$Exception
-    )
-
-    while ($Exception -is [System.Management.Automation.MethodInvocationException] -and $Exception.InnerException) {
-        $Exception = $Exception.InnerException
-    }
-
-    if ($Exception.GetType() -ne [System.IO.IOException]) {
-        return $false
-    }
-
-    if ((Get-TerraformOS) -eq 'windows') {
-        return $Exception.HResult -in @(0x80070020, 0x80070021)
-    }
-
-    return $Exception.HResult -in @(11, 35)
-}
-
 function Wait-TerraposhLock {
     param (
         [string]$Path,
@@ -706,7 +548,9 @@ function Wait-TerraposhLock {
             return [System.IO.File]::Open($Path, [System.IO.FileMode]::OpenOrCreate, [System.IO.FileAccess]::ReadWrite, [System.IO.FileShare]::None)
         }
         catch [System.IO.IOException] {
-            if (-not (Test-LockContention -Exception $_.Exception)) {
+            $Exception = $_.Exception.InnerException ?? $_.Exception
+
+            if ($Exception.GetType() -ne [System.IO.IOException]) {
                 throw
             }
 
@@ -721,18 +565,14 @@ function Wait-TerraposhLock {
 
 function Expand-TerraformArchive {
     param (
-        [string]$ArchiveFile,
-        [string]$ExpandDirectory,
-        [string]$BinaryFile,
-        [string]$VerifiedFile,
-        [string]$ExpectedHash
+        [hashtable]$Release
     )
 
-    Remove-Item -Path $ExpandDirectory -Recurse -Force -ErrorAction Ignore
-    Expand-Archive -Path $ArchiveFile -DestinationPath $ExpandDirectory -Force | Out-Null
-    $BinaryHash = Get-FileSha256 -Path $BinaryFile
-    Set-Content -Path $VerifiedFile -Value "${ExpectedHash}`nsignature=Verified`nbinary=${BinaryHash}" -NoNewline
-    $script:VerifiedBinaries[$BinaryFile] = $BinaryHash
+    Remove-Item -Path $Release.ExpandDirectory -Recurse -Force -ErrorAction Ignore
+    Expand-Archive -Path $Release.OutFile -DestinationPath $Release.ExpandDirectory -Force | Out-Null
+    $BinaryHash = Get-FileSha256 -Path $Release.BinaryFile
+    Set-Content -Path $Release.VerifiedFile -Value $BinaryHash -NoNewline
+    $script:VerifiedBinaries[$Release.BinaryFile] = $BinaryHash
 }
 
 function Get-TerraformBinary {
@@ -740,12 +580,11 @@ function Get-TerraformBinary {
         [string]$Version
     )
 
-    $NativeRelease = Get-TerraformRelease -Version $Version
-    $Candidates = @($NativeRelease)
-    $FallbackArchitecture = Get-TerraformFallbackArchitecture
+    $Candidates = @(Get-TerraformRelease -Version $Version)
+    $NativeRelease = $Candidates[0]
 
-    if ($FallbackArchitecture) {
-        $Candidates += Get-TerraformRelease -Version $NativeRelease.Version -Architecture $FallbackArchitecture -IsFallback
+    if ((Get-TerraformArchitecture) -eq 'arm64' -and (Get-TerraformOS) -in @('darwin', 'windows')) {
+        $Candidates += Get-TerraformRelease -Version $NativeRelease.Version -Architecture 'amd64' -IsFallback
     }
 
     foreach ($Candidate in $Candidates) {
@@ -773,42 +612,30 @@ function Get-TerraformBinary {
     }
 
     $ExpectedHash = $Checksums[$Release.FileName]
-    $OutFile = $Release.OutFile
-    $ExpandDirectory = $Release.ExpandDirectory
-    $BinaryFile = $Release.BinaryFile
-    $VerifiedFile = $Release.VerifiedFile
-    $Lock = Wait-TerraposhLock -Path "${OutFile}.lock"
+    $Lock = Wait-TerraposhLock -Path "$($Release.OutFile).lock"
 
     try {
-        if ((Get-TerraformCachedBinaryStatus -BinaryFile $BinaryFile -VerifiedFile $VerifiedFile) -eq 'Valid') {
-            return $BinaryFile
+        if ((Get-TerraformCachedBinaryStatus -BinaryFile $Release.BinaryFile -VerifiedFile $Release.VerifiedFile) -eq 'Valid') {
+            return $Release.BinaryFile
         }
 
-        if ((Test-Path -Path $OutFile) -and -not (Test-FileChecksum -Path $OutFile -ExpectedHash $ExpectedHash)) {
-            Write-Warning -Message "Cached archive failed SHA-256 verification, re-downloading: ${OutFile}"
-            Remove-Item -Path $OutFile -Force
+        if ((Test-Path -Path $Release.OutFile) -and (Get-FileSha256 -Path $Release.OutFile) -cne $ExpectedHash) {
+            Write-Warning -Message "Cached archive failed SHA-256 verification, re-downloading: $($Release.OutFile)"
+            Remove-Item -Path $Release.OutFile -Force
         }
 
-        if (-not (Test-Path -Path $OutFile)) {
-            $DownloadFile = "${OutFile}.download"
+        if (-not (Test-Path -Path $Release.OutFile)) {
+            Invoke-TerraformReleaseRequest -Uri $Release.Uri -OutFile $Release.OutFile
 
-            try {
-                Invoke-TerraformReleaseRequest -Uri $Release.Uri -OutFile $DownloadFile
-
-                if (-not (Test-FileChecksum -Path $DownloadFile -ExpectedHash $ExpectedHash)) {
-                    throw "SHA-256 checksum mismatch for $($Release.Uri), refusing to use it."
-                }
-
-                Move-Item -Path $DownloadFile -Destination $OutFile -Force
-            }
-            finally {
-                Remove-Item -Path $DownloadFile -Force -ErrorAction Ignore
+            if ((Get-FileSha256 -Path $Release.OutFile) -cne $ExpectedHash) {
+                Remove-Item -Path $Release.OutFile -Force
+                throw "SHA-256 checksum mismatch for $($Release.Uri), refusing to use it."
             }
         }
 
-        Expand-TerraformArchive -ArchiveFile $OutFile -ExpandDirectory $ExpandDirectory -BinaryFile $BinaryFile -VerifiedFile $VerifiedFile -ExpectedHash $ExpectedHash
+        Expand-TerraformArchive -Release $Release
 
-        return $BinaryFile
+        return $Release.BinaryFile
     }
     finally {
         $Lock.Dispose()
