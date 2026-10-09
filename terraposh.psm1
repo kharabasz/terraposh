@@ -337,6 +337,19 @@ function Get-LatestTerraformVersion {
     return $SemVer
 }
 
+function Get-TerraformArchitecture {
+    # OS architecture (not process), so an x64 pwsh under Rosetta/emulation still gets the native build
+    $Architecture = [System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture
+
+    switch ($Architecture) {
+        'X64' { return 'amd64' }
+        'Arm64' { return 'arm64' }
+        'X86' { return '386' }
+        'Arm' { return 'arm' }
+        default { throw "Unsupported architecture for Terraform: ${Architecture}" }
+    }
+}
+
 function Get-TerraformRelease {
     param (
         [string]$Version
@@ -355,7 +368,7 @@ function Get-TerraformRelease {
     }
 
     $OSPart = $IsWindows ? 'windows' : ($IsMacOS ? 'darwin' : 'linux')
-    $ArchPart = [HttpUtility]::UrlEncode(${env:PROCESSOR_ARCHITECTURE}?.ToLower()) ?? 'amd64'
+    $ArchPart = Get-TerraformArchitecture
     $FileName = "terraform_${Version}_${OSPart}_${ArchPart}.zip"
     $BaseUri = "https://releases.hashicorp.com/terraform/${Version}"
 
@@ -414,7 +427,7 @@ function Get-TerraformReleaseChecksum {
         Where-Object { ($_ -split '\s+', 2)[1] -ceq $Release.FileName }
 
     if (@($ChecksumLines).Count -ne 1) {
-        throw "Unable to find a single SHA-256 checksum for $($Release.FileName) in $($Release.ChecksumsUri)"
+        throw "No published SHA-256 checksum for $($Release.FileName) in $($Release.ChecksumsUri), this version may not be built for this OS/architecture"
     }
 
     $Hash = ($ChecksumLines -split '\s+', 2)[0]

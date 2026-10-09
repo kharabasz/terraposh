@@ -11,6 +11,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Downloads are restricted to `https://releases.hashicorp.com` with redirects refused
 - `TerraformVersion` is validated as a semantic version, and a warning is shown when no version is pinned
 - Previously cached archives/binaries are re-verified on first use
+- Fixed the wrong architecture being downloaded on macOS/Linux (e.g. `amd64` on Apple Silicon); architecture is now detected from the OS on all platforms
 
 ## [2.1.0] - 2025-03-18
 
