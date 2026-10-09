@@ -337,9 +337,15 @@ function Get-LatestTerraformVersion {
     return $SemVer
 }
 
+function Get-TerraformOS {
+    return ($IsWindows ? 'windows' : ($IsMacOS ? 'darwin' : 'linux'))
+}
+
 function Get-TerraformArchitecture {
-    # OS architecture (not process), so an x64 pwsh under Rosetta/emulation still gets the native build
-    $Architecture = [System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture
+    param (
+        # OS architecture (not process), so an x64 pwsh under Rosetta/emulation still gets the native build
+        [string]$Architecture = [System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture
+    )
 
     switch ($Architecture) {
         'X64' { return 'amd64' }
@@ -351,10 +357,13 @@ function Get-TerraformArchitecture {
 }
 
 function Get-TerraformFallbackArchitecture {
-    # Arm64 macOS (Rosetta 2) and Windows can run amd64 builds, e.g. Terraform < 1.0.2 has no darwin_arm64 build
-    $Architecture = Get-TerraformArchitecture
+    param (
+        [string]$OS = (Get-TerraformOS),
+        [string]$Architecture = (Get-TerraformArchitecture)
+    )
 
-    if ($Architecture -eq 'arm64' -and ($IsMacOS -or $IsWindows)) {
+    # Arm64 macOS (Rosetta 2) and Windows can run amd64 builds, e.g. Terraform < 1.0.2 has no darwin_arm64 build
+    if ($Architecture -eq 'arm64' -and $OS -in @('darwin', 'windows')) {
         return 'amd64'
     }
 
@@ -380,7 +389,7 @@ function Get-TerraformRelease {
         throw "Invalid Terraform version: '${Version}'"
     }
 
-    $OSPart = $IsWindows ? 'windows' : ($IsMacOS ? 'darwin' : 'linux')
+    $OSPart = Get-TerraformOS
     $ArchPart = [string]::IsNullOrWhiteSpace($Architecture) ? (Get-TerraformArchitecture) : $Architecture
     $Platform = "${OSPart}_${ArchPart}"
     $FileName = "terraform_${Version}_${Platform}.zip"

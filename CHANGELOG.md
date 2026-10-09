@@ -13,6 +13,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Previously cached archives/binaries are re-verified on first use
 - Fixed the wrong architecture being downloaded on macOS/Linux (e.g. `amd64` on Apple Silicon); architecture is now detected from the OS on all platforms
 - On Arm64 macOS and Windows, versions with no native build (e.g. Terraform < 1.0.2 on Apple Silicon) fall back to the `amd64` build under emulation, with a warning
+- Added Pester tests and a GitHub Actions workflow running them on Linux, Windows and macOS
 
 ## [2.1.0] - 2025-03-18
 

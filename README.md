@@ -67,6 +67,16 @@ Downloads are only made over HTTPS from HashiCorp's official release server (`ht
 
 The build matching your OS and CPU architecture is used. On Arm64 macOS and Windows, if a version has no native build (e.g. Terraform < 1.0.2 on Apple Silicon), the `amd64` build is used under emulation (Rosetta 2 on macOS) and a warning is shown.
 
+## Running tests
+
+Tests use [Pester](https://pester.dev) and run in GitHub Actions on Linux, Windows and macOS (amd64 and arm64). To run them locally:
+
+```powershell
+Install-Module -Name Pester -RequiredVersion 6.2.0 -Scope CurrentUser
+Invoke-Pester -Path ./tests                                  # all tests
+Invoke-Pester -Path ./tests -ExcludeTagFilter Integration    # skip downloading from releases.hashicorp.com
+```
+
 ## Commands
 
 All functions support the same params.
