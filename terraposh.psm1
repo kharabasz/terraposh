@@ -1,4 +1,4 @@
-#Requires -Version 7
+#Requires -Version 7.2
 
 using namespace System.Collections
 using namespace System.Management.Automation
@@ -434,8 +434,6 @@ function New-TerraposhTemporaryDirectory {
 $HashiCorpKeyFile = Join-Path -Path $PSScriptRoot -ChildPath 'hashicorp.asc'
 $HashiCorpKeyFingerprint = 'C874011F0AB405110D02105534365D9472D7468F'
 $HashiCorpKeyId = '72D7468F'
-$HashiCorpAppleTeamId = 'D38WU7D763'
-$HashiCorpAuthenticodeSigner = 'HashiCorp, Inc.'
 
 function ConvertFrom-ArmoredPgpKey {
     param (
@@ -476,19 +474,53 @@ function ConvertFrom-ArmoredPgpKey {
     return [System.Convert]::FromBase64String($Base64.ToString())
 }
 
-function Test-GpgvInstalled {
-    return [bool](Get-Command -Name 'gpgv' -CommandType Application -ErrorAction Ignore)
+function Get-GpgvPath {
+    $Command = Get-Command -Name 'gpgv' -CommandType Application -ErrorAction Ignore | Select-Object -First 1
+
+    if ($Command) {
+        return $Command.Source
+    }
+
+    if ((Get-TerraformOS) -eq 'windows' -and -not [string]::IsNullOrWhiteSpace($env:ProgramFiles)) {
+        $GitGpgv = Join-Path -Path $env:ProgramFiles -ChildPath 'Git' -AdditionalChildPath 'usr', 'bin', 'gpgv.exe'
+
+        if (Test-Path -Path $GitGpgv -PathType Leaf) {
+            return $GitGpgv
+        }
+    }
+
+    return $null
+}
+
+function ConvertTo-GpgvPath {
+    param (
+        [string]$Path
+    )
+
+    if ((Get-TerraformOS) -eq 'windows') {
+        return $Path -replace '\\', '/'
+    }
+
+    return $Path
 }
 
 function Invoke-Gpgv {
     param (
+        [string]$GpgvPath,
         [string]$Keyring,
         [string]$Signature,
         [string]$File,
         [string]$HomeDirectory
     )
 
-    $Output = & gpgv --homedir $HomeDirectory --status-fd 1 --keyring $Keyring $Signature $File 2>&1
+    $Arguments = @(
+        '--homedir', (ConvertTo-GpgvPath -Path $HomeDirectory)
+        '--status-fd', '1'
+        '--keyring', (ConvertTo-GpgvPath -Path $Keyring)
+        (ConvertTo-GpgvPath -Path $Signature)
+        (ConvertTo-GpgvPath -Path $File)
+    )
+    $Output = & $GpgvPath @Arguments 2>&1
 
     return @{
         ExitCode = $LASTEXITCODE
@@ -503,8 +535,10 @@ function Assert-TerraformChecksumsSignature {
         [string]$ChecksumsFile
     )
 
-    if (-not (Test-GpgvInstalled)) {
-        throw 'gpgv is required to verify HashiCorp''s signature on Terraform releases, install the gpgv or gnupg package.'
+    $GpgvPath = Get-GpgvPath
+
+    if (-not $GpgvPath) {
+        throw 'gpgv is required to verify HashiCorp''s signature on Terraform releases. Install GnuPG: brew install gnupg (macOS), Gpg4win or Git for Windows (Windows), or the gpgv or gnupg package (Linux).'
     }
 
     $WorkDirectory = New-TerraposhTemporaryDirectory
@@ -514,7 +548,7 @@ function Assert-TerraformChecksumsSignature {
         $SignatureFile = Join-Path -Path $WorkDirectory -ChildPath 'SHA256SUMS.sig'
         [System.IO.File]::WriteAllBytes($Keyring, (ConvertFrom-ArmoredPgpKey -Path $HashiCorpKeyFile))
         Invoke-TerraformReleaseRequest -Uri $Release.SignatureUri -OutFile $SignatureFile
-        $Result = Invoke-Gpgv -Keyring $Keyring -Signature $SignatureFile -File $ChecksumsFile -HomeDirectory $WorkDirectory
+        $Result = Invoke-Gpgv -GpgvPath $GpgvPath -Keyring $Keyring -Signature $SignatureFile -File $ChecksumsFile -HomeDirectory $WorkDirectory
     }
     finally {
         Remove-Item -Path $WorkDirectory -Recurse -Force -ErrorAction Ignore
@@ -532,69 +566,6 @@ function Assert-TerraformChecksumsSignature {
     Write-Verbose -Message "Verified $($Release.ChecksumsUri) is signed by ${HashiCorpKeyFingerprint}"
 }
 
-function Invoke-Codesign {
-    param (
-        [string[]]$Arguments
-    )
-
-    $Output = & /usr/bin/codesign @Arguments 2>&1 | ForEach-Object { "$_" }
-
-    return @{
-        ExitCode = $LASTEXITCODE
-        Output   = @($Output)
-    }
-}
-
-function Assert-TerraformCodesignSignature {
-    param (
-        [string]$BinaryFile
-    )
-
-    $Requirement = "=anchor apple generic and certificate 1[field.1.2.840.113635.100.6.2.6] exists and certificate leaf[field.1.2.840.113635.100.6.1.13] exists and certificate leaf[subject.OU] = ${HashiCorpAppleTeamId}"
-    $Result = Invoke-Codesign -Arguments @('--verify', '--strict', '--test-requirement', $Requirement, $BinaryFile)
-
-    if ($Result.ExitCode -ne 0) {
-        throw "Code signature verification failed for ${BinaryFile}, refusing to use it.`n$($Result.Output -join "`n")"
-    }
-
-    Write-Verbose -Message "Verified ${BinaryFile} is code-signed by Apple team ${HashiCorpAppleTeamId}"
-}
-
-function Get-TerraformAuthenticodeSignature {
-    param (
-        [string]$Path
-    )
-
-    return Get-AuthenticodeSignature -FilePath $Path
-}
-
-function Assert-TerraformAuthenticodeSignature {
-    param (
-        [string]$BinaryFile
-    )
-
-    $Signature = Get-TerraformAuthenticodeSignature -Path $BinaryFile
-    $Status = "$($Signature.Status)"
-    $Signer = $Signature.SignerCertificate?.GetNameInfo([System.Security.Cryptography.X509Certificates.X509NameType]::SimpleName, $false)
-
-    if ($Status -ne 'Valid' -or $Signer -cne $HashiCorpAuthenticodeSigner) {
-        throw "Authenticode signature verification failed for ${BinaryFile} (status: ${Status}, signer: '${Signer}'), refusing to use it."
-    }
-
-    Write-Verbose -Message "Verified ${BinaryFile} is Authenticode-signed by ${Signer}"
-}
-
-function Assert-TerraformBinarySignature {
-    param (
-        [string]$BinaryFile
-    )
-
-    switch (Get-TerraformOS) {
-        'darwin' { Assert-TerraformCodesignSignature -BinaryFile $BinaryFile }
-        'windows' { Assert-TerraformAuthenticodeSignature -BinaryFile $BinaryFile }
-    }
-}
-
 function Get-TerraformReleaseChecksums {
     param (
         [hashtable]$Release
@@ -606,9 +577,7 @@ function Get-TerraformReleaseChecksums {
         $ChecksumsFile = Join-Path -Path $WorkDirectory -ChildPath 'SHA256SUMS'
         Invoke-TerraformReleaseRequest -Uri $Release.ChecksumsUri -OutFile $ChecksumsFile
 
-        if ((Get-TerraformOS) -eq 'linux') {
-            Assert-TerraformChecksumsSignature -Release $Release -ChecksumsFile $ChecksumsFile
-        }
+        Assert-TerraformChecksumsSignature -Release $Release -ChecksumsFile $ChecksumsFile
 
         $Content = Get-Content -Path $ChecksumsFile -Raw
     }
@@ -719,15 +688,6 @@ function Get-TerraformBinary {
 
     Remove-Item -Path $ExpandDirectory -Recurse -Force -ErrorAction Ignore
     Expand-Archive -Path $OutFile -DestinationPath $ExpandDirectory -Force | Out-Null
-
-    try {
-        Assert-TerraformBinarySignature -BinaryFile $BinaryFile
-    }
-    catch {
-        Remove-Item -Path $ExpandDirectory -Recurse -Force -ErrorAction Ignore
-        Remove-Item -Path $OutFile -Force -ErrorAction Ignore
-        throw
-    }
 
     Set-Content -Path $VerifiedFile -Value "${ExpectedHash}`nsignature=Verified" -NoNewline
 

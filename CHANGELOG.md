@@ -10,11 +10,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Terraform archives are now verified against HashiCorp's published SHA-256 checksums before extraction; mismatches fail the command
 - Downloads are restricted to `https://releases.hashicorp.com` with redirects refused
 - `TerraformVersion` is validated as a semantic version, and a warning is shown when no version is pinned
-- Previously cached archives/binaries are re-verified on first use
+- Archives and binaries cached by earlier versions are re-verified on first use
 - Fixed the wrong architecture being downloaded on macOS/Linux (e.g. `amd64` on Apple Silicon); architecture is now detected from the OS on all platforms
 - On Arm64 macOS and Windows, versions with no native build (e.g. Terraform < 1.0.2 on Apple Silicon) fall back to the `amd64` build under emulation, with a warning
-- Added signature verification of Terraform releases: `gpgv` against HashiCorp's bundled release key on Linux, Apple Developer ID code signature on macOS, and Authenticode on Windows
-- Signature verification always runs: a missing `gpgv` on Linux, or an unsigned binary on macOS/Windows, fails the command
+- Added signature verification of Terraform releases: `terraform_<version>_SHA256SUMS` is verified with `gpgv` against HashiCorp's bundled release key on every OS
+- Signature verification always runs: a missing `gpgv` fails the command (on Windows, Git for Windows' `gpgv.exe` is used if `gpgv` isn't on `PATH`)
+- PowerShell 7.2 or later is now required
 - Added Pester tests and a GitHub Actions workflow running them on Linux, Windows and macOS
 
 ## [2.1.0] - 2025-03-18

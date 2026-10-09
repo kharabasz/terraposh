@@ -13,7 +13,7 @@
     Author            = 'Steve Mastrorocco'
     Copyright         = '(c) Steve Mastrorocco. All rights reserved.'
     Description       = 'PowerShell wrapper for running Terraform'
-    PowerShellVersion = '7.0'
+    PowerShellVersion = '7.2'
     FunctionsToExport = @(
         'Invoke-Terraposh',
         'Invoke-TerraposhPlan',

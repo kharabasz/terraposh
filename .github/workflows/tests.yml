@@ -22,6 +22,10 @@ jobs:
         with:
           persist-credentials: false
 
+      - name: Install GnuPG
+        if: runner.os == 'macOS'
+        run: brew install gnupg
+
       - name: Install Pester
         shell: pwsh
         run: Install-Module -Name Pester -RequiredVersion 6.2.0 -Repository PSGallery -Scope CurrentUser -Force -SkipPublisherCheck

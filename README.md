@@ -67,21 +67,21 @@ Downloads are only made over HTTPS from HashiCorp's official release server (`ht
 
 ### Signature verification
 
-On top of the checksum check, terraposh verifies that the release really comes from HashiCorp:
+On top of the checksum check, terraposh verifies that the release really comes from HashiCorp. Before any checksum is trusted, `terraform_<version>_SHA256SUMS` is verified with `gpgv` against HashiCorp's release key. The key is bundled as `hashicorp.asc` (fingerprint `C874 011F 0AB4 0511 0D02  1055 3436 5D94 72D7 468F`). The signed checksum file names every archive by version, OS and architecture, so a verified checksum proves the exact build.
 
-| OS | Check | Requires |
-|---|---|---|
-| Linux | `terraform_<version>_SHA256SUMS` is verified with `gpgv` against HashiCorp's release key (bundled as `hashicorp.asc`, fingerprint `C874 011F 0AB4 0511 0D02  1055 3436 5D94 72D7 468F`) before any checksum is trusted | `gpgv` (preinstalled on most distributions; package `gpgv` or `gnupg`) |
-| macOS | The extracted binary must carry a valid Apple Developer ID signature from HashiCorp (team `D38WU7D763`) | nothing (`codesign` is built in) |
-| Windows | The extracted binary must carry a valid Authenticode signature from `HashiCorp, Inc.` | nothing (`Get-AuthenticodeSignature` is built in) |
+Verification always runs and can't be turned off. The command fails if the signature is invalid, from anyone other than HashiCorp, or can't be checked because `gpgv` is missing. `gpgv` comes with GnuPG:
 
-Verification always runs and can't be turned off. The command fails if the signature is invalid, from anyone other than HashiCorp, or can't be checked: no `gpgv` on Linux, or an unsigned binary on macOS/Windows.
+| OS | Install |
+|---|---|
+| Linux | Preinstalled on most distributions; otherwise the `gpgv` or `gnupg` package |
+| macOS | `brew install gnupg` |
+| Windows | [Gpg4win](https://gpg4win.org), or [Git for Windows](https://gitforwindows.org), whose `gpgv.exe` is used automatically if `gpgv` isn't on `PATH` |
 
 The build matching your OS and CPU architecture is used. On Arm64 macOS and Windows, if a version has no native build (e.g. Terraform < 1.0.2 on Apple Silicon), the `amd64` build is used under emulation (Rosetta 2 on macOS) and a warning is shown.
 
 ## Running tests
 
-Tests use [Pester](https://pester.dev) and run in GitHub Actions on Linux, Windows and macOS (amd64 and arm64). To run them locally:
+Tests use [Pester](https://pester.dev) and run in GitHub Actions on Linux, Windows and macOS (amd64 and arm64). The integration tests need `gpgv` and are skipped locally without it. To run them locally:
 
 ```powershell
 Install-Module -Name Pester -RequiredVersion 6.2.0 -Scope CurrentUser
