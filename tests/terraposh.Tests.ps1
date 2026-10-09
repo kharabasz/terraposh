@@ -130,11 +130,11 @@ InModuleScope terraposh {
             $script:Sums = "${HashA}  terraform_1.9.8_linux_amd64.zip`n${HashB}  terraform_1.9.8_darwin_arm64.zip`n`n"
             Mock Invoke-TerraformReleaseRequest { Set-Content -Path $OutFile -Value $script:Sums -NoNewline }
             Mock Get-TerraformOS { 'darwin' }
-            Mock Test-TerraformChecksumsSignature { 'Verified' }
+            Mock Assert-TerraformChecksumsSignature {}
         }
 
         It 'parses entries and normalises hashes to lowercase' {
-            $Checksums = (Get-TerraformReleaseChecksums -Release $Release -Mode 'Auto').Checksums
+            $Checksums = Get-TerraformReleaseChecksums -Release $Release
 
             $Checksums.Count | Should -Be 2
             $Checksums['terraform_1.9.8_linux_amd64.zip'] | Should -Be ('a' * 64)
@@ -145,19 +145,19 @@ InModuleScope terraposh {
         It 'handles CRLF line endings' {
             $script:Sums = "${HashA}  terraform_1.9.8_linux_amd64.zip`r`n"
 
-            (Get-TerraformReleaseChecksums -Release $Release -Mode 'Auto').Checksums.Keys | Should -Be 'terraform_1.9.8_linux_amd64.zip'
+            (Get-TerraformReleaseChecksums -Release $Release).Keys | Should -Be 'terraform_1.9.8_linux_amd64.zip'
         }
 
         It 'throws on a malformed hash' {
             $script:Sums = 'abc123  terraform_1.9.8_linux_amd64.zip'
 
-            { Get-TerraformReleaseChecksums -Release $Release -Mode 'Auto' } | Should -Throw '*Malformed SHA256SUMS entry*'
+            { Get-TerraformReleaseChecksums -Release $Release } | Should -Throw '*Malformed SHA256SUMS entry*'
         }
 
         It 'throws on duplicate entries' {
             $script:Sums = "${HashA}  terraform_1.9.8_linux_amd64.zip`n${HashB}  terraform_1.9.8_linux_amd64.zip"
 
-            { Get-TerraformReleaseChecksums -Release $Release -Mode 'Auto' } | Should -Throw '*Malformed SHA256SUMS entry*'
+            { Get-TerraformReleaseChecksums -Release $Release } | Should -Throw '*Malformed SHA256SUMS entry*'
         }
 
         It 'leaves signature checks to the binary on <OS>' -TestCases @(
@@ -166,76 +166,33 @@ InModuleScope terraposh {
         ) {
             Mock Get-TerraformOS { $OS }
 
-            (Get-TerraformReleaseChecksums -Release $Release -Mode 'Required').Signature | Should -Be 'NotApplicable'
-            Should -Invoke Test-TerraformChecksumsSignature -Times 0
+            Get-TerraformReleaseChecksums -Release $Release | Out-Null
+            Should -Invoke Assert-TerraformChecksumsSignature -Times 0
         }
 
         It 'verifies the downloaded checksum file signature on linux before parsing it' {
             Mock Get-TerraformOS { 'linux' }
-            Mock Test-TerraformChecksumsSignature {
+            Mock Assert-TerraformChecksumsSignature {
                 # The exact downloaded bytes are handed to gpgv
                 Get-Content -Path $ChecksumsFile -Raw | Should -Be $script:Sums
-                'Verified'
             }
 
-            (Get-TerraformReleaseChecksums -Release $Release -Mode 'Required').Signature | Should -Be 'Verified'
-            Should -Invoke Test-TerraformChecksumsSignature -Times 1 -ParameterFilter { $Mode -eq 'Required' }
+            Get-TerraformReleaseChecksums -Release $Release | Out-Null
+            Should -Invoke Assert-TerraformChecksumsSignature -Times 1
         }
 
         It 'does not parse checksums whose signature fails on linux' {
             Mock Get-TerraformOS { 'linux' }
-            Mock Test-TerraformChecksumsSignature { throw 'PGP signature verification failed' }
+            Mock Assert-TerraformChecksumsSignature { throw 'PGP signature verification failed' }
 
-            { Get-TerraformReleaseChecksums -Release $Release -Mode 'Auto' } | Should -Throw '*PGP signature verification failed*'
-        }
-
-        It 'skips signature checks when Off' {
-            Mock Get-TerraformOS { 'linux' }
-
-            (Get-TerraformReleaseChecksums -Release $Release -Mode 'Off').Signature | Should -Be 'Off'
-            Should -Invoke Test-TerraformChecksumsSignature -Times 0
+            { Get-TerraformReleaseChecksums -Release $Release } | Should -Throw '*PGP signature verification failed*'
         }
 
         It 'cleans up its temporary directory' {
             $Before = @(Get-ChildItem -Path ([System.IO.Path]::GetTempPath()) -Filter 'terraposh-*' -ErrorAction Ignore).Count
-            Get-TerraformReleaseChecksums -Release $Release -Mode 'Auto' | Out-Null
+            Get-TerraformReleaseChecksums -Release $Release | Out-Null
 
             @(Get-ChildItem -Path ([System.IO.Path]::GetTempPath()) -Filter 'terraposh-*' -ErrorAction Ignore).Count | Should -Be $Before
-        }
-    }
-
-    Describe 'Get-SignatureVerificationMode' {
-        It 'defaults to Auto' {
-            Get-SignatureVerificationMode -Mode '' | Should -Be 'Auto'
-            Get-SignatureVerificationMode -Mode $null | Should -Be 'Auto'
-        }
-
-        It 'normalises <Mode> to <Expected>' -TestCases @(
-            @{ Mode = 'required'; Expected = 'Required' }
-            @{ Mode = ' AUTO '; Expected = 'Auto' }
-            @{ Mode = 'off'; Expected = 'Off' }
-        ) {
-            Get-SignatureVerificationMode -Mode $Mode | Should -BeExactly $Expected
-        }
-
-        It 'rejects an unknown mode' {
-            { Get-SignatureVerificationMode -Mode 'Sometimes' } | Should -Throw '*Invalid SignatureVerification*'
-        }
-    }
-
-    Describe 'Confirm-SignatureUnavailable' {
-        BeforeEach {
-            Mock Write-Warning {}
-        }
-
-        It 'warns and reports Unverified in Auto mode' {
-            Confirm-SignatureUnavailable -Message 'gpgv not found' -Mode 'Auto' | Should -Be 'Unverified'
-            Should -Invoke Write-Warning -Times 1 -ParameterFilter { $Message -like 'gpgv not found*skipping signature verification*' }
-        }
-
-        It 'throws in Required mode' {
-            { Confirm-SignatureUnavailable -Message 'gpgv not found' -Mode 'Required' } | Should -Throw '*gpgv not found*Required*'
-            Should -Invoke Write-Warning -Times 0
         }
     }
 
@@ -274,7 +231,7 @@ InModuleScope terraposh {
         }
     }
 
-    Describe 'Test-TerraformChecksumsSignature' {
+    Describe 'Assert-TerraformChecksumsSignature' {
         BeforeAll {
             $Release = @{
                 ChecksumsUri = 'https://releases.hashicorp.com/terraform/1.9.8/terraform_1.9.8_SHA256SUMS'
@@ -289,14 +246,13 @@ InModuleScope terraposh {
         }
 
         BeforeEach {
-            Mock Write-Warning {}
             Mock Test-GpgvInstalled { $true }
             Mock Invoke-TerraformReleaseRequest { Set-Content -Path $OutFile -Value 'sig' }
             Mock Invoke-Gpgv { @{ ExitCode = 0; Status = @('[GNUPG:] GOODSIG C820C6D5CD27AB87 HashiCorp', (New-ValidSig $HashiCorpKeyFingerprint)); Errors = @() } }
         }
 
         It 'accepts a valid signature from the pinned HashiCorp key' {
-            Test-TerraformChecksumsSignature -Release $Release -ChecksumsFile $ChecksumsFile -Mode 'Required' | Should -Be 'Verified'
+            { Assert-TerraformChecksumsSignature -Release $Release -ChecksumsFile $ChecksumsFile } | Should -Not -Throw
 
             Should -Invoke Invoke-TerraformReleaseRequest -Times 1 -ParameterFilter { $Uri -eq $Release.SignatureUri }
             Should -Invoke Invoke-Gpgv -Times 1 -ParameterFilter { $File -eq $ChecksumsFile }
@@ -310,64 +266,53 @@ InModuleScope terraposh {
                 @{ ExitCode = 0; Status = @(New-ValidSig $HashiCorpKeyFingerprint); Errors = @() }
             }
 
-            Test-TerraformChecksumsSignature -Release $Release -ChecksumsFile $ChecksumsFile -Mode 'Auto' | Should -Be 'Verified'
+            { Assert-TerraformChecksumsSignature -Release $Release -ChecksumsFile $ChecksumsFile } | Should -Not -Throw
         }
 
         It 'rejects a valid signature from a different key' {
             Mock Invoke-Gpgv { @{ ExitCode = 0; Status = @(New-ValidSig ('0' * 40)); Errors = @() } }
 
-            { Test-TerraformChecksumsSignature -Release $Release -ChecksumsFile $ChecksumsFile -Mode 'Auto' } | Should -Throw '*PGP signature verification failed*'
+            { Assert-TerraformChecksumsSignature -Release $Release -ChecksumsFile $ChecksumsFile } | Should -Throw '*PGP signature verification failed*'
         }
 
         It 'rejects a bad signature' {
             Mock Invoke-Gpgv { @{ ExitCode = 1; Status = @('[GNUPG:] BADSIG C820C6D5CD27AB87 HashiCorp'); Errors = @('gpgv: BAD signature') } }
 
-            { Test-TerraformChecksumsSignature -Release $Release -ChecksumsFile $ChecksumsFile -Mode 'Auto' } | Should -Throw '*PGP signature verification failed*BAD signature*'
+            { Assert-TerraformChecksumsSignature -Release $Release -ChecksumsFile $ChecksumsFile } | Should -Throw '*PGP signature verification failed*BAD signature*'
         }
 
         It 'rejects a non-zero gpgv exit code even with a VALIDSIG line' {
             Mock Invoke-Gpgv { @{ ExitCode = 2; Status = @(New-ValidSig $HashiCorpKeyFingerprint); Errors = @() } }
 
-            { Test-TerraformChecksumsSignature -Release $Release -ChecksumsFile $ChecksumsFile -Mode 'Auto' } | Should -Throw '*PGP signature verification failed*'
+            { Assert-TerraformChecksumsSignature -Release $Release -ChecksumsFile $ChecksumsFile } | Should -Throw '*PGP signature verification failed*'
         }
 
         It 'ignores VALIDSIG text that only appears on stderr' {
             Mock Invoke-Gpgv { @{ ExitCode = 0; Status = @(); Errors = @(New-ValidSig $HashiCorpKeyFingerprint) } }
 
-            { Test-TerraformChecksumsSignature -Release $Release -ChecksumsFile $ChecksumsFile -Mode 'Auto' } | Should -Throw '*PGP signature verification failed*'
+            { Assert-TerraformChecksumsSignature -Release $Release -ChecksumsFile $ChecksumsFile } | Should -Throw '*PGP signature verification failed*'
         }
 
         It 'fails when the signature file cannot be downloaded' {
             Mock Invoke-TerraformReleaseRequest { throw 'Response status code does not indicate success: 404 (Not Found).' }
 
-            { Test-TerraformChecksumsSignature -Release $Release -ChecksumsFile $ChecksumsFile -Mode 'Auto' } | Should -Throw '*404*'
+            { Assert-TerraformChecksumsSignature -Release $Release -ChecksumsFile $ChecksumsFile } | Should -Throw '*404*'
             Should -Invoke Invoke-Gpgv -Times 0
         }
 
-        It 'warns and reports Unverified when gpgv is missing in Auto mode' {
+        It 'fails when gpgv is not installed' {
             Mock Test-GpgvInstalled { $false }
 
-            Test-TerraformChecksumsSignature -Release $Release -ChecksumsFile $ChecksumsFile -Mode 'Auto' | Should -Be 'Unverified'
-            Should -Invoke Write-Warning -Times 1 -ParameterFilter { $Message -like '*gpgv not found*' }
+            { Assert-TerraformChecksumsSignature -Release $Release -ChecksumsFile $ChecksumsFile } | Should -Throw '*gpgv is required*'
             Should -Invoke Invoke-TerraformReleaseRequest -Times 0
-        }
-
-        It 'throws when gpgv is missing in Required mode' {
-            Mock Test-GpgvInstalled { $false }
-
-            { Test-TerraformChecksumsSignature -Release $Release -ChecksumsFile $ChecksumsFile -Mode 'Required' } | Should -Throw '*gpgv not found*'
         }
     }
 
-    Describe 'Test-TerraformCodesignSignature' {
-        BeforeEach {
-            Mock Write-Warning {}
-        }
-
+    Describe 'Assert-TerraformCodesignSignature' {
         It 'accepts a binary signed by HashiCorp''s Developer ID' {
             Mock Invoke-Codesign { @{ ExitCode = 0; Output = @() } }
 
-            Test-TerraformCodesignSignature -BinaryFile 'terraform' -Mode 'Required' | Should -Be 'Verified'
+            { Assert-TerraformCodesignSignature -BinaryFile 'terraform' } | Should -Not -Throw
             Should -Invoke Invoke-Codesign -Times 1 -ParameterFilter {
                 $Arguments[0] -eq '--verify' -and $Arguments -contains '--strict' -and $Arguments[-1] -eq 'terraform' -and
                 ($Arguments -like '=anchor apple generic and *certificate leaf`[subject.OU`] = D38WU7D763').Count -eq 1
@@ -377,27 +322,15 @@ InModuleScope terraposh {
         It 'rejects <Case>' -TestCases @(
             @{ Case = 'another team'; ExitCode = 3; Output = 'test-requirement: code failed to satisfy specified code requirement(s)' }
             @{ Case = 'a modified binary'; ExitCode = 1; Output = 'terraform: invalid signature (code or signature have been modified)' }
+            @{ Case = 'an unsigned binary'; ExitCode = 1; Output = 'terraform: code object is not signed at all' }
         ) {
             Mock Invoke-Codesign { @{ ExitCode = $ExitCode; Output = @($Output) } }
 
-            { Test-TerraformCodesignSignature -BinaryFile 'terraform' -Mode 'Auto' } | Should -Throw '*Code signature verification failed*'
-        }
-
-        It 'warns for an unsigned binary in Auto mode' {
-            Mock Invoke-Codesign { @{ ExitCode = 1; Output = @('terraform: code object is not signed at all') } }
-
-            Test-TerraformCodesignSignature -BinaryFile 'terraform' -Mode 'Auto' | Should -Be 'Unverified'
-            Should -Invoke Write-Warning -Times 1 -ParameterFilter { $Message -like '*is not code-signed*' }
-        }
-
-        It 'throws for an unsigned binary in Required mode' {
-            Mock Invoke-Codesign { @{ ExitCode = 1; Output = @('terraform: code object is not signed at all') } }
-
-            { Test-TerraformCodesignSignature -BinaryFile 'terraform' -Mode 'Required' } | Should -Throw '*is not code-signed*Required*'
+            { Assert-TerraformCodesignSignature -BinaryFile 'terraform' } | Should -Throw "*Code signature verification failed*${Output}*"
         }
     }
 
-    Describe 'Test-TerraformAuthenticodeSignature' {
+    Describe 'Assert-TerraformAuthenticodeSignature' {
         BeforeAll {
             function New-Certificate([string]$Subject) {
                 $Key = [System.Security.Cryptography.RSA]::Create(2048)
@@ -410,94 +343,88 @@ InModuleScope terraposh {
             $OtherCertificate = New-Certificate 'CN="Evil Corp", O="HashiCorp, Inc."'
         }
 
-        BeforeEach {
-            Mock Write-Warning {}
-        }
-
         It 'accepts a valid signature from HashiCorp' {
             Mock Get-TerraformAuthenticodeSignature { [pscustomobject]@{ Status = 'Valid'; SignerCertificate = $HashiCorpCertificate } }
 
-            Test-TerraformAuthenticodeSignature -BinaryFile 'terraform.exe' -Mode 'Required' | Should -Be 'Verified'
+            { Assert-TerraformAuthenticodeSignature -BinaryFile 'terraform.exe' } | Should -Not -Throw
             Should -Invoke Get-TerraformAuthenticodeSignature -Times 1 -ParameterFilter { $Path -eq 'terraform.exe' }
         }
 
         It 'rejects a valid signature from another signer' {
             Mock Get-TerraformAuthenticodeSignature { [pscustomobject]@{ Status = 'Valid'; SignerCertificate = $OtherCertificate } }
 
-            { Test-TerraformAuthenticodeSignature -BinaryFile 'terraform.exe' -Mode 'Auto' } | Should -Throw "*signer: 'Evil Corp'*"
+            { Assert-TerraformAuthenticodeSignature -BinaryFile 'terraform.exe' } | Should -Throw "*signer: 'Evil Corp'*"
         }
 
         It 'rejects status <Status>' -TestCases @(
             @{ Status = 'HashMismatch' }
             @{ Status = 'NotTrusted' }
             @{ Status = 'UnknownError' }
+            @{ Status = 'NotSigned' }
         ) {
-            Mock Get-TerraformAuthenticodeSignature { [pscustomobject]@{ Status = $Status; SignerCertificate = $HashiCorpCertificate } }
+            Mock Get-TerraformAuthenticodeSignature { [pscustomobject]@{ Status = $Status; SignerCertificate = ($Status -eq 'NotSigned' ? $null : $HashiCorpCertificate) } }
 
-            { Test-TerraformAuthenticodeSignature -BinaryFile 'terraform.exe' -Mode 'Auto' } | Should -Throw "*status: ${Status}*"
-        }
-
-        It 'warns for an unsigned binary in Auto mode' {
-            Mock Get-TerraformAuthenticodeSignature { [pscustomobject]@{ Status = 'NotSigned'; SignerCertificate = $null } }
-
-            Test-TerraformAuthenticodeSignature -BinaryFile 'terraform.exe' -Mode 'Auto' | Should -Be 'Unverified'
-            Should -Invoke Write-Warning -Times 1 -ParameterFilter { $Message -like '*is not Authenticode-signed*' }
-        }
-
-        It 'throws for an unsigned binary in Required mode' {
-            Mock Get-TerraformAuthenticodeSignature { [pscustomobject]@{ Status = 'NotSigned'; SignerCertificate = $null } }
-
-            { Test-TerraformAuthenticodeSignature -BinaryFile 'terraform.exe' -Mode 'Required' } | Should -Throw '*is not Authenticode-signed*Required*'
+            { Assert-TerraformAuthenticodeSignature -BinaryFile 'terraform.exe' } | Should -Throw "*status: ${Status}*"
         }
     }
 
-    Describe 'Test-TerraformBinarySignature' {
+    Describe 'Assert-TerraformBinarySignature' {
         BeforeEach {
-            Mock Test-TerraformCodesignSignature { 'codesign' }
-            Mock Test-TerraformAuthenticodeSignature { 'authenticode' }
+            Mock Assert-TerraformCodesignSignature {}
+            Mock Assert-TerraformAuthenticodeSignature {}
         }
 
-        It 'uses <Expected> on <OS>' -TestCases @(
-            @{ OS = 'darwin'; Expected = 'codesign' }
-            @{ OS = 'windows'; Expected = 'authenticode' }
-            @{ OS = 'linux'; Expected = 'NotApplicable' }
-        ) {
-            Mock Get-TerraformOS { $OS }
+        It 'uses codesign on macOS' {
+            Mock Get-TerraformOS { 'darwin' }
 
-            Test-TerraformBinarySignature -BinaryFile 'terraform' -Mode 'Auto' | Should -Be $Expected
+            Assert-TerraformBinarySignature -BinaryFile 'terraform'
+
+            Should -Invoke Assert-TerraformCodesignSignature -Times 1 -ParameterFilter { $BinaryFile -eq 'terraform' }
+            Should -Invoke Assert-TerraformAuthenticodeSignature -Times 0
+        }
+
+        It 'uses Authenticode on Windows' {
+            Mock Get-TerraformOS { 'windows' }
+
+            Assert-TerraformBinarySignature -BinaryFile 'terraform.exe'
+
+            Should -Invoke Assert-TerraformAuthenticodeSignature -Times 1 -ParameterFilter { $BinaryFile -eq 'terraform.exe' }
+            Should -Invoke Assert-TerraformCodesignSignature -Times 0
+        }
+
+        It 'does nothing on Linux, where the checksum signature was verified' {
+            Mock Get-TerraformOS { 'linux' }
+
+            Assert-TerraformBinarySignature -BinaryFile 'terraform'
+
+            Should -Invoke Assert-TerraformCodesignSignature -Times 0
+            Should -Invoke Assert-TerraformAuthenticodeSignature -Times 0
         }
     }
 
     Describe 'Test-TerraformVerifiedMarker' {
-        It 'returns <Expected> for signature=<Signature> in <Mode> mode' -TestCases @(
-            @{ Signature = 'Verified'; Mode = 'Required'; Expected = $true }
-            @{ Signature = 'Unverified'; Mode = 'Required'; Expected = $false }
-            @{ Signature = 'Off'; Mode = 'Required'; Expected = $false }
-            @{ Signature = 'Verified'; Mode = 'Auto'; Expected = $true }
-            @{ Signature = 'Unverified'; Mode = 'Auto'; Expected = $true }
-            @{ Signature = 'Off'; Mode = 'Auto'; Expected = $false }
-            @{ Signature = 'Off'; Mode = 'Off'; Expected = $true }
-            @{ Signature = 'Unverified'; Mode = 'Off'; Expected = $true }
-        ) {
+        BeforeAll {
             $Marker = Join-Path -Path $TestDrive -ChildPath '.terraposh-sha256'
-            Set-Content -Path $Marker -Value "$('a' * 64)`nsignature=${Signature}" -NoNewline
-
-            Test-TerraformVerifiedMarker -Path $Marker -Mode $Mode | Should -Be $Expected
         }
 
-        It 'does not trust a marker without a signature line in <Mode> mode' -TestCases @(
-            @{ Mode = 'Required' }
-            @{ Mode = 'Auto' }
-            @{ Mode = 'Off' }
-        ) {
-            $Marker = Join-Path -Path $TestDrive -ChildPath '.terraposh-sha256'
-            Set-Content -Path $Marker -Value ('a' * 64) -NoNewline
+        It 'trusts a marker recording a verified signature' {
+            Set-Content -Path $Marker -Value "$('a' * 64)`nsignature=Verified" -NoNewline
 
-            Test-TerraformVerifiedMarker -Path $Marker -Mode $Mode | Should -BeFalse
+            Test-TerraformVerifiedMarker -Path $Marker | Should -BeTrue
+        }
+
+        It 'does not trust <Case>' -TestCases @(
+            @{ Case = 'a hash-only marker from before signature checks'; Content = ('a' * 64) }
+            @{ Case = 'an unverified signature'; Content = "$('a' * 64)`nsignature=Unverified" }
+            @{ Case = 'signatures turned off'; Content = "$('a' * 64)`nsignature=Off" }
+        ) {
+            Set-Content -Path $Marker -Value $Content -NoNewline
+
+            Test-TerraformVerifiedMarker -Path $Marker | Should -BeFalse
         }
 
         It 'returns false when there is no marker' {
-            Test-TerraformVerifiedMarker -Path (Join-Path -Path $TestDrive -ChildPath 'missing') -Mode 'Auto' | Should -BeFalse
+            Test-TerraformVerifiedMarker -Path (Join-Path -Path $TestDrive -ChildPath 'missing') | Should -BeFalse
         }
     }
 
@@ -542,15 +469,14 @@ InModuleScope terraposh {
                 'terraform_1.9.8_darwin_arm64.zip' = $FakeHash
                 'terraform_1.9.8_darwin_amd64.zip' = $FakeHash
             }
-            $script:ChecksumsSignature = 'NotApplicable'
 
             Mock Set-TerraformVendoredDirectory { Join-Path -Path $TestDrive -ChildPath 'vendored' }
             Mock Get-TerraformOS { 'darwin' }
             Mock Get-TerraformArchitecture { 'arm64' }
             Mock Get-TerraformFallbackArchitecture { 'amd64' }
             Mock Write-Warning {}
-            Mock Get-TerraformReleaseChecksums { [pscustomobject]@{ Checksums = $script:PublishedChecksums; Signature = $script:ChecksumsSignature } }
-            Mock Test-TerraformBinarySignature { 'Verified' }
+            Mock Get-TerraformReleaseChecksums { $script:PublishedChecksums }
+            Mock Assert-TerraformBinarySignature {}
             Mock Invoke-TerraformReleaseRequest { Copy-Item -Path $FakeArchive -Destination $OutFile } -ParameterFilter { $OutFile }
         }
 
@@ -581,7 +507,7 @@ InModuleScope terraposh {
 
             { Get-TerraformBinary -Version '1.9.8' } | Should -Throw '*SHA-256 checksum mismatch*'
             Get-ChildItem -Path (Get-VendoredPath '') -Force | Should -BeNullOrEmpty
-            Should -Invoke Test-TerraformBinarySignature -Times 0
+            Should -Invoke Assert-TerraformBinarySignature -Times 0
         }
 
         It 're-downloads a tampered cached archive' {
@@ -624,54 +550,20 @@ InModuleScope terraposh {
         }
 
         Context 'signature verification' {
-            It 'defaults to Auto' {
-                Get-TerraformBinary -Version '1.9.8' | Out-Null
+            It 'checks the extracted binary''s signature before marking it verified' {
+                Mock Assert-TerraformBinarySignature {
+                    Get-Content -Path $BinaryFile -Raw | Should -Be 'genuine terraform'
+                    Test-Path -Path (Get-VendoredPath 'terraform_1.9.8_darwin_arm64/.terraposh-sha256') | Should -BeFalse
+                }
 
-                Should -Invoke Get-TerraformReleaseChecksums -Times 1 -ParameterFilter { $Mode -eq 'Auto' }
-                Should -Invoke Test-TerraformBinarySignature -Times 1 -ParameterFilter { $Mode -eq 'Auto' }
-            }
+                $Binary = Get-TerraformBinary -Version '1.9.8'
 
-            It 'rejects an invalid mode before downloading' {
-                { Get-TerraformBinary -Version '1.9.8' -SignatureVerification 'Sometimes' } | Should -Throw '*Invalid SignatureVerification*'
-                Should -Invoke Get-TerraformReleaseChecksums -Times 0
-            }
-
-            It 'checks the extracted binary when the checksums were not signature-checked (macOS/Windows)' {
-                Mock Test-TerraformBinarySignature { Get-Content -Path $BinaryFile -Raw | Should -Be 'genuine terraform'; 'Verified' }
-
-                $Binary = Get-TerraformBinary -Version '1.9.8' -SignatureVerification 'Required'
-
-                Should -Invoke Test-TerraformBinarySignature -Times 1 -ParameterFilter { $BinaryFile -eq $Binary -and $Mode -eq 'Required' }
-            }
-
-            It 'does not re-check the binary when the checksums were signature-verified (Linux)' {
-                $script:ChecksumsSignature = 'Verified'
-
-                Get-TerraformBinary -Version '1.9.8' -SignatureVerification 'Required' | Out-Null
-
-                Should -Invoke Test-TerraformBinarySignature -Times 0
+                Should -Invoke Assert-TerraformBinarySignature -Times 1 -ParameterFilter { $BinaryFile -eq $Binary }
                 Get-Content -Path (Get-VendoredPath 'terraform_1.9.8_darwin_arm64/.terraposh-sha256') -Force | Should -Be @($FakeHash, 'signature=Verified')
             }
 
-            It 'records Unverified when the signature could not be checked in Auto mode' {
-                Mock Test-TerraformBinarySignature { 'Unverified' }
-
-                Get-TerraformBinary -Version '1.9.8' | Out-Null
-
-                Get-Content -Path (Get-VendoredPath 'terraform_1.9.8_darwin_arm64/.terraposh-sha256') -Force | Should -Be @($FakeHash, 'signature=Unverified')
-            }
-
-            It 'records Off without checking signatures' {
-                $script:ChecksumsSignature = 'Off'
-
-                Get-TerraformBinary -Version '1.9.8' -SignatureVerification 'Off' | Out-Null
-
-                Should -Invoke Test-TerraformBinarySignature -Times 0
-                Get-Content -Path (Get-VendoredPath 'terraform_1.9.8_darwin_arm64/.terraposh-sha256') -Force | Should -Be @($FakeHash, 'signature=Off')
-            }
-
             It 'removes the extracted binary and archive when the binary signature fails' {
-                Mock Test-TerraformBinarySignature { throw 'Code signature verification failed' }
+                Mock Assert-TerraformBinarySignature { throw 'Code signature verification failed' }
 
                 { Get-TerraformBinary -Version '1.9.8' } | Should -Throw '*Code signature verification failed*'
                 Get-ChildItem -Path (Get-VendoredPath '') -Force | Should -BeNullOrEmpty
@@ -685,45 +577,18 @@ InModuleScope terraposh {
                 Get-ChildItem -Path (Get-VendoredPath '') -Force | Should -BeNullOrEmpty
             }
 
-            It 're-verifies a cached Unverified binary when Required' {
-                Mock Test-TerraformBinarySignature { 'Unverified' }
-                Get-TerraformBinary -Version '1.9.8' | Out-Null
-                Mock Test-TerraformBinarySignature { 'Verified' }
-
-                Get-TerraformBinary -Version '1.9.8' -SignatureVerification 'Required' | Out-Null
-
-                Should -Invoke Get-TerraformReleaseChecksums -Times 2
-                Should -Invoke Invoke-TerraformReleaseRequest -Times 1
-                Get-Content -Path (Get-VendoredPath 'terraform_1.9.8_darwin_arm64/.terraposh-sha256') -Force | Should -Be @($FakeHash, 'signature=Verified')
-            }
-
-            It 'reuses a cached Unverified binary in Auto mode' {
-                Mock Test-TerraformBinarySignature { 'Unverified' }
-                Get-TerraformBinary -Version '1.9.8' | Out-Null
-                Get-TerraformBinary -Version '1.9.8' | Out-Null
-
-                Should -Invoke Get-TerraformReleaseChecksums -Times 1
-            }
-
-            It 're-verifies a binary cached with signatures Off once they are turned back on' {
-                $script:ChecksumsSignature = 'Off'
-                Get-TerraformBinary -Version '1.9.8' -SignatureVerification 'Off' | Out-Null
-                $script:ChecksumsSignature = 'NotApplicable'
-
-                Get-TerraformBinary -Version '1.9.8' | Out-Null
-
-                Should -Invoke Get-TerraformReleaseChecksums -Times 2
-                Should -Invoke Test-TerraformBinarySignature -Times 1
-            }
-
-            It 'does not trust a verification marker written before signature checks existed' {
+            It 're-verifies a binary cached <Case>' -TestCases @(
+                @{ Case = 'before signature checks existed'; Content = 'HASH' }
+                @{ Case = 'with an Unverified signature'; Content = "HASH`nsignature=Unverified" }
+                @{ Case = 'with signatures Off'; Content = "HASH`nsignature=Off" }
+            ) {
                 $Directory = Get-VendoredPath 'terraform_1.9.8_darwin_arm64'
                 New-Item -Path $Directory -ItemType Directory | Out-Null
                 Set-Content -Path (Join-Path -Path $Directory -ChildPath $BinaryFileName) -Value 'legacy'
-                Set-Content -Path (Join-Path -Path $Directory -ChildPath '.terraposh-sha256') -Value $FakeHash -NoNewline
+                Set-Content -Path (Join-Path -Path $Directory -ChildPath '.terraposh-sha256') -Value ($Content -replace 'HASH', $FakeHash) -NoNewline
 
                 Get-Content -Path (Get-TerraformBinary -Version '1.9.8') -Raw | Should -Be 'genuine terraform'
-                Should -Invoke Test-TerraformBinarySignature -Times 1
+                Should -Invoke Assert-TerraformBinarySignature -Times 1
             }
         }
 
@@ -776,45 +641,6 @@ InModuleScope terraposh {
         }
     }
 
-    Describe 'Invoke-Terraposh SignatureVerification' {
-        BeforeEach {
-            Mock Get-Config { @{ TerraformVersion = '1.9.8'; SignatureVerification = $script:ConfigMode } }
-            Mock Get-TerraformBinary { 'terraform' }
-            Mock Invoke-Expression { $global:LASTEXITCODE = 0 }
-            $script:ConfigMode = $null
-        }
-
-        It 'passes the config file setting to Get-TerraformBinary' {
-            $script:ConfigMode = 'Required'
-
-            Invoke-Terraposh -TerraformCommand 'version' -Explicit
-
-            Should -Invoke Get-TerraformBinary -Times 1 -ParameterFilter { $Version -eq '1.9.8' -and $SignatureVerification -eq 'Required' }
-        }
-
-        It 'lets -SignatureVerification override the config file' {
-            $script:ConfigMode = 'Required'
-
-            Invoke-Terraposh -TerraformCommand 'version' -Explicit -SignatureVerification 'Off'
-
-            Should -Invoke Get-TerraformBinary -Times 1 -ParameterFilter { $SignatureVerification -eq 'Off' }
-        }
-
-        It 'passes the setting through the workspace commands' {
-            Mock Get-TerraformWorkspaceName { 'default' }
-            Mock Invoke-Expression { $global:LASTEXITCODE = 0; 'default' }
-
-            Invoke-Terraposh -TerraformCommand 'plan' -SignatureVerification 'Required'
-
-            Should -Invoke Get-TerraformBinary -ParameterFilter { $SignatureVerification -ne 'Required' } -Times 0
-            Should -Invoke Get-TerraformBinary -ParameterFilter { $SignatureVerification -eq 'Required' } -Times 3
-        }
-
-        It 'rejects an invalid -SignatureVerification value' {
-            { Invoke-Terraposh -TerraformCommand 'version' -SignatureVerification 'Sometimes' } | Should -Throw
-        }
-    }
-
     Describe 'Signature verification against releases.hashicorp.com' -Tag 'Integration' {
         # Evaluated during discovery for -Skip
         $DiscoveryOS = Get-TerraformOS
@@ -831,10 +657,10 @@ InModuleScope terraposh {
             $Release = Get-TerraformRelease -Version '1.9.8'
         }
 
-        It 'downloads, verifies and runs Terraform <Version> for this platform with signatures Required' -Skip:($DiscoveryOS -eq 'linux' -and -not $DiscoveryGpgv) -TestCases @(
+        It 'downloads, verifies and runs Terraform <Version> for this platform' -Skip:($DiscoveryOS -eq 'linux' -and -not $DiscoveryGpgv) -TestCases @(
             @{ Version = '1.9.8' }
         ) {
-            $Binary = Get-TerraformBinary -Version $Version -SignatureVerification 'Required'
+            $Binary = Get-TerraformBinary -Version $Version
 
             Test-Path -Path $Binary | Should -BeTrue
             Get-Content -Path (Join-Path -Path (Split-Path -Parent $Binary) -ChildPath '.terraposh-sha256*') -Force | Should -Contain 'signature=Verified'
@@ -859,27 +685,27 @@ InModuleScope terraposh {
             }
 
             It 'verifies the real SHA256SUMS signature with gpgv' {
-                Test-TerraformChecksumsSignature -Release $Release -ChecksumsFile $ChecksumsFile -Mode 'Required' | Should -Be 'Verified'
+                { Assert-TerraformChecksumsSignature -Release $Release -ChecksumsFile $ChecksumsFile } | Should -Not -Throw
             }
 
             It 'rejects a tampered SHA256SUMS' {
                 $TamperedFile = Join-Path -Path $TestDrive -ChildPath 'SHA256SUMS.tampered'
                 Set-Content -Path $TamperedFile -Value ((Get-Content -Path $ChecksumsFile -Raw) -replace '^.', '0') -NoNewline
 
-                { Test-TerraformChecksumsSignature -Release $Release -ChecksumsFile $TamperedFile -Mode 'Required' } | Should -Throw '*PGP signature verification failed*'
+                { Assert-TerraformChecksumsSignature -Release $Release -ChecksumsFile $TamperedFile } | Should -Throw '*PGP signature verification failed*'
             }
 
             It 'rejects the real signature of a different release' {
                 $OtherRelease = $Release.Clone()
                 $OtherRelease.SignatureUri = $Release.SignatureUri -replace '1\.9\.8', '1.9.7'
 
-                { Test-TerraformChecksumsSignature -Release $OtherRelease -ChecksumsFile $ChecksumsFile -Mode 'Required' } | Should -Throw '*PGP signature verification failed*'
+                { Assert-TerraformChecksumsSignature -Release $OtherRelease -ChecksumsFile $ChecksumsFile } | Should -Throw '*PGP signature verification failed*'
             }
         }
 
         Context 'macOS and Windows' -Skip:($DiscoveryOS -eq 'linux') {
             BeforeAll {
-                $Binary = Get-TerraformBinary -Version '1.9.8' -SignatureVerification 'Required'
+                $Binary = Get-TerraformBinary -Version '1.9.8'
                 $TamperedBinary = Join-Path -Path $TestDrive -ChildPath "tampered-$(Split-Path -Leaf $Binary)"
                 $Bytes = [System.IO.File]::ReadAllBytes($Binary)
                 $Bytes[$Bytes.Length / 2] = $Bytes[$Bytes.Length / 2] -bxor 0xFF
@@ -890,16 +716,16 @@ InModuleScope terraposh {
             }
 
             It 'verifies the real binary signature' {
-                Test-TerraformBinarySignature -BinaryFile $Binary -Mode 'Required' | Should -Be 'Verified'
+                { Assert-TerraformBinarySignature -BinaryFile $Binary } | Should -Not -Throw
             }
 
             It 'rejects a modified binary' {
-                { Test-TerraformBinarySignature -BinaryFile $TamperedBinary -Mode 'Auto' } | Should -Throw '*signature verification failed*'
+                { Assert-TerraformBinarySignature -BinaryFile $TamperedBinary } | Should -Throw '*signature verification failed*'
             }
 
             It 'rejects a validly signed binary from another publisher' {
                 # pwsh is signed by Microsoft
-                { Test-TerraformBinarySignature -BinaryFile $OtherPublisherBinary -Mode 'Auto' } | Should -Throw '*signature verification failed*'
+                { Assert-TerraformBinarySignature -BinaryFile $OtherPublisherBinary } | Should -Throw '*signature verification failed*'
             }
         }
     }

@@ -14,7 +14,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Fixed the wrong architecture being downloaded on macOS/Linux (e.g. `amd64` on Apple Silicon); architecture is now detected from the OS on all platforms
 - On Arm64 macOS and Windows, versions with no native build (e.g. Terraform < 1.0.2 on Apple Silicon) fall back to the `amd64` build under emulation, with a warning
 - Added signature verification of Terraform releases: `gpgv` against HashiCorp's bundled release key on Linux, Apple Developer ID code signature on macOS, and Authenticode on Windows
-- Added `SignatureVerification` config / `-SignatureVerification` parameter (`Auto` default, `Required`, `Off`)
+- Signature verification always runs: a missing `gpgv` on Linux, or an unsigned binary on macOS/Windows, fails the command
 - Added Pester tests and a GitHub Actions workflow running them on Linux, Windows and macOS
 
 ## [2.1.0] - 2025-03-18
