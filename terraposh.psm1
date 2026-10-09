@@ -613,6 +613,28 @@ function Test-TerraformVerifiedMarker {
     return (Get-Content -Path $Path -Force) -ccontains 'signature=Verified'
 }
 
+function Wait-TerraposhLock {
+    param (
+        [string]$Path,
+        [int]$TimeoutSeconds = 600
+    )
+
+    $Deadline = [DateTime]::UtcNow.AddSeconds($TimeoutSeconds)
+
+    while ($true) {
+        try {
+            return [System.IO.File]::Open($Path, [System.IO.FileMode]::OpenOrCreate, [System.IO.FileAccess]::ReadWrite, [System.IO.FileShare]::None)
+        }
+        catch [System.IO.IOException] {
+            if ([DateTime]::UtcNow -ge $Deadline) {
+                throw "Timed out after ${TimeoutSeconds}s waiting for another terraposh process to release ${Path}"
+            }
+
+            Start-Sleep -Milliseconds 250
+        }
+    }
+}
+
 function Get-TerraformBinary {
     param (
         [string]$Version
@@ -640,7 +662,8 @@ function Get-TerraformBinary {
     }
 
     if ($Release.IsFallback) {
-        Write-Warning -Message "Terraform $($Release.Version) has no $($NativeRelease.Platform) build, using $($Release.Platform) under emulation (Rosetta 2 on macOS)."
+        $Emulation = (Get-TerraformOS) -eq 'darwin' ? 'Rosetta 2' : 'x64 emulation'
+        Write-Warning -Message "Terraform $($Release.Version) has no $($NativeRelease.Platform) build, using $($Release.Platform) under ${Emulation}."
     }
 
     $ExpectedHash = $Checksums[$Release.FileName]
@@ -648,35 +671,45 @@ function Get-TerraformBinary {
     $ExpandDirectory = $Release.ExpandDirectory
     $BinaryFile = $Release.BinaryFile
     $VerifiedFile = $Release.VerifiedFile
+    $Lock = Wait-TerraposhLock -Path "${OutFile}.lock"
 
-    if ((Test-Path -Path $OutFile) -and -not (Test-FileChecksum -Path $OutFile -ExpectedHash $ExpectedHash)) {
-        Write-Warning -Message "Cached archive failed SHA-256 verification, re-downloading: ${OutFile}"
-        Remove-Item -Path $OutFile -Force
-    }
+    try {
+        if ((Test-Path -Path $BinaryFile) -and (Test-TerraformVerifiedMarker -Path $VerifiedFile)) {
+            return $BinaryFile
+        }
 
-    if (-not (Test-Path -Path $OutFile)) {
-        $DownloadFile = "${OutFile}.download"
+        if ((Test-Path -Path $OutFile) -and -not (Test-FileChecksum -Path $OutFile -ExpectedHash $ExpectedHash)) {
+            Write-Warning -Message "Cached archive failed SHA-256 verification, re-downloading: ${OutFile}"
+            Remove-Item -Path $OutFile -Force
+        }
 
-        try {
-            Invoke-TerraformReleaseRequest -Uri $Release.Uri -OutFile $DownloadFile
+        if (-not (Test-Path -Path $OutFile)) {
+            $DownloadFile = "${OutFile}.download"
 
-            if (-not (Test-FileChecksum -Path $DownloadFile -ExpectedHash $ExpectedHash)) {
-                throw "SHA-256 checksum mismatch for $($Release.Uri), refusing to use it."
+            try {
+                Invoke-TerraformReleaseRequest -Uri $Release.Uri -OutFile $DownloadFile
+
+                if (-not (Test-FileChecksum -Path $DownloadFile -ExpectedHash $ExpectedHash)) {
+                    throw "SHA-256 checksum mismatch for $($Release.Uri), refusing to use it."
+                }
+
+                Move-Item -Path $DownloadFile -Destination $OutFile -Force
             }
+            finally {
+                Remove-Item -Path $DownloadFile -Force -ErrorAction Ignore
+            }
+        }
 
-            Move-Item -Path $DownloadFile -Destination $OutFile -Force
-        }
-        finally {
-            Remove-Item -Path $DownloadFile -Force -ErrorAction Ignore
-        }
+        Remove-Item -Path $ExpandDirectory -Recurse -Force -ErrorAction Ignore
+        Expand-Archive -Path $OutFile -DestinationPath $ExpandDirectory -Force | Out-Null
+
+        Set-Content -Path $VerifiedFile -Value "${ExpectedHash}`nsignature=Verified" -NoNewline
+
+        return $BinaryFile
     }
-
-    Remove-Item -Path $ExpandDirectory -Recurse -Force -ErrorAction Ignore
-    Expand-Archive -Path $OutFile -DestinationPath $ExpandDirectory -Force | Out-Null
-
-    Set-Content -Path $VerifiedFile -Value "${ExpectedHash}`nsignature=Verified" -NoNewline
-
-    return $BinaryFile
+    finally {
+        $Lock.Dispose()
+    }
 }
 
 function Get-TerraformBinaryFileName {

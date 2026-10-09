@@ -81,7 +81,7 @@ The build matching your OS and CPU architecture is used. On Arm64 macOS and Wind
 
 ## Running tests
 
-Tests use [Pester](https://pester.dev) and run in GitHub Actions on Linux, Windows and macOS (amd64 and arm64). The integration tests need `gpgv` and are skipped locally without it. To run them locally:
+Tests use [Pester](https://pester.dev) and run in GitHub Actions on Linux and Windows (amd64 and arm64) and macOS (Apple Silicon). The integration tests need `gpgv` and are skipped locally without it. To run them locally:
 
 ```powershell
 Install-Module -Name Pester -RequiredVersion 6.2.0 -Scope CurrentUser

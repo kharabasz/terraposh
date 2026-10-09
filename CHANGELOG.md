@@ -16,6 +16,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Added signature verification of Terraform releases: `terraform_<version>_SHA256SUMS` is verified with `gpgv` against HashiCorp's bundled release key on every OS
 - Signature verification always runs: a missing `gpgv` fails the command (on Windows, Git for Windows' `gpgv.exe` is used if `gpgv` isn't on `PATH`)
 - PowerShell 7.2 or later is now required
+- Concurrent terraposh runs no longer interfere when downloading the same Terraform build; downloads and extraction are serialised per build with a lock file
 - Added Pester tests and a GitHub Actions workflow running them on Linux, Windows and macOS
 
 ## [2.1.0] - 2025-03-18

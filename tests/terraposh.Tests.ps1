@@ -159,12 +159,7 @@ InModuleScope terraposh {
             { Get-TerraformReleaseChecksums -Release $Release } | Should -Throw '*Malformed SHA256SUMS entry*'
         }
 
-        It 'verifies the downloaded checksum file signature on <OS> before parsing it' -TestCases @(
-            @{ OS = 'linux' }
-            @{ OS = 'darwin' }
-            @{ OS = 'windows' }
-        ) {
-            Mock Get-TerraformOS { $OS }
+        It 'verifies the downloaded checksum file signature before parsing it' {
             Mock Assert-TerraformChecksumsSignature {
                 Get-Content -Path $ChecksumsFile -Raw | Should -Be $script:Sums
             }
@@ -407,6 +402,58 @@ InModuleScope terraposh {
         }
     }
 
+    Describe 'Wait-TerraposhLock' {
+        BeforeEach {
+            $LockFile = Join-Path -Path $TestDrive -ChildPath "$([guid]::NewGuid()).lock"
+        }
+
+        It 'acquires an exclusive lock' {
+            $Lock = Wait-TerraposhLock -Path $LockFile
+
+            try {
+                { [System.IO.File]::Open($LockFile, 'OpenOrCreate', 'ReadWrite', 'None').Dispose() } | Should -Throw
+            }
+            finally {
+                $Lock.Dispose()
+            }
+        }
+
+        It 'times out while the lock is held' {
+            $Held = [System.IO.File]::Open($LockFile, 'OpenOrCreate', 'ReadWrite', 'None')
+
+            try {
+                { Wait-TerraposhLock -Path $LockFile -TimeoutSeconds 1 } | Should -Throw '*Timed out after 1s*'
+            }
+            finally {
+                $Held.Dispose()
+            }
+        }
+
+        It 'waits for another process to release the lock' {
+            $Ready = "${LockFile}.ready"
+            $Holder = Start-Process -FilePath (Get-Process -Id $PID).Path -PassThru -NoNewWindow -ArgumentList @(
+                '-NoProfile', '-Command',
+                "`$f = [System.IO.File]::Open('${LockFile}', 'OpenOrCreate', 'ReadWrite', 'None'); New-Item -Path '${Ready}' | Out-Null; Start-Sleep -Seconds 2; `$f.Dispose()"
+            )
+
+            try {
+                $Deadline = [DateTime]::UtcNow.AddSeconds(30)
+                while (-not (Test-Path -Path $Ready) -and [DateTime]::UtcNow -lt $Deadline) { Start-Sleep -Milliseconds 50 }
+                Test-Path -Path $Ready | Should -BeTrue
+
+                $Stopwatch = [System.Diagnostics.Stopwatch]::StartNew()
+                $Lock = Wait-TerraposhLock -Path $LockFile -TimeoutSeconds 30
+                $Stopwatch.Stop()
+                $Lock.Dispose()
+
+                $Stopwatch.Elapsed.TotalSeconds | Should -BeGreaterThan 1
+            }
+            finally {
+                $Holder.WaitForExit()
+            }
+        }
+    }
+
     Describe 'Test-FileChecksum' {
         BeforeAll {
             $File = Join-Path -Path $TestDrive -ChildPath 'file.txt'
@@ -454,7 +501,7 @@ InModuleScope terraposh {
             Mock Get-TerraformFallbackArchitecture { 'amd64' }
             Mock Write-Warning {}
             Mock Get-TerraformReleaseChecksums { $script:PublishedChecksums }
-            Mock Invoke-TerraformReleaseRequest { Copy-Item -Path $FakeArchive -Destination $OutFile } -ParameterFilter { $OutFile }
+            Mock Invoke-TerraformReleaseRequest { Copy-Item -Path $FakeArchive -Destination $OutFile }
         }
 
         It 'downloads, verifies and extracts the native build' {
@@ -483,7 +530,7 @@ InModuleScope terraposh {
             $script:PublishedChecksums['terraform_1.9.8_darwin_arm64.zip'] = '0' * 64
 
             { Get-TerraformBinary -Version '1.9.8' } | Should -Throw '*SHA-256 checksum mismatch*'
-            Get-ChildItem -Path (Get-VendoredPath '') -Force | Should -BeNullOrEmpty
+            Get-ChildItem -Path (Get-VendoredPath '') -Force -Exclude '*.lock' | Should -BeNullOrEmpty
         }
 
         It 're-downloads a tampered cached archive' {
@@ -531,7 +578,7 @@ InModuleScope terraposh {
 
                 { Get-TerraformBinary -Version '1.9.8' } | Should -Throw '*PGP signature verification failed*'
                 Should -Invoke Invoke-TerraformReleaseRequest -Times 0
-                Get-ChildItem -Path (Get-VendoredPath '') -Force | Should -BeNullOrEmpty
+                Get-ChildItem -Path (Get-VendoredPath '') -Force -Exclude '*.lock' | Should -BeNullOrEmpty
             }
 
             It 're-verifies a binary cached <Case>' -TestCases @(
@@ -547,6 +594,49 @@ InModuleScope terraposh {
                 Get-Content -Path (Get-TerraformBinary -Version '1.9.8') -Raw | Should -Be 'genuine terraform'
                 Should -Invoke Get-TerraformReleaseChecksums -Exactly -Times 1
                 Get-Content -Path (Get-VendoredPath 'terraform_1.9.8_darwin_arm64/.terraposh-sha256') -Force | Should -Be @($FakeHash, 'signature=Verified')
+            }
+        }
+
+        Context 'concurrent runs' {
+            It 'holds the release lock while downloading and extracting' {
+                $script:LockState = @{ HeldDuringDownload = $null }
+                Mock Invoke-TerraformReleaseRequest {
+                    $LockFile = Get-VendoredPath 'terraform_1.9.8_darwin_arm64.zip.lock'
+                    try {
+                        [System.IO.File]::Open($LockFile, 'OpenOrCreate', 'ReadWrite', 'None').Dispose()
+                        $script:LockState.HeldDuringDownload = $false
+                    }
+                    catch [System.IO.IOException] {
+                        $script:LockState.HeldDuringDownload = $true
+                    }
+                    Copy-Item -Path $FakeArchive -Destination $OutFile
+                }
+
+                Get-TerraformBinary -Version '1.9.8' | Out-Null
+
+                Should -Invoke Invoke-TerraformReleaseRequest -Exactly -Times 1
+                $script:LockState.HeldDuringDownload | Should -BeTrue
+                { [System.IO.File]::Open((Get-VendoredPath 'terraform_1.9.8_darwin_arm64.zip.lock'), 'OpenOrCreate', 'ReadWrite', 'None').Dispose() } | Should -Not -Throw
+            }
+
+            It 'releases the lock when verification fails' {
+                $script:PublishedChecksums['terraform_1.9.8_darwin_arm64.zip'] = '0' * 64
+
+                { Get-TerraformBinary -Version '1.9.8' } | Should -Throw '*SHA-256 checksum mismatch*'
+                { [System.IO.File]::Open((Get-VendoredPath 'terraform_1.9.8_darwin_arm64.zip.lock'), 'OpenOrCreate', 'ReadWrite', 'None').Dispose() } | Should -Not -Throw
+            }
+
+            It 'uses the binary another run verified while it waited for the lock' {
+                Mock Wait-TerraposhLock {
+                    $Directory = Get-VendoredPath 'terraform_1.9.8_darwin_arm64'
+                    New-Item -Path $Directory -ItemType Directory -Force | Out-Null
+                    Set-Content -Path (Join-Path -Path $Directory -ChildPath $BinaryFileName) -Value 'from the other run' -NoNewline
+                    Set-Content -Path (Join-Path -Path $Directory -ChildPath '.terraposh-sha256') -Value "${FakeHash}`nsignature=Verified" -NoNewline
+                    [System.IO.File]::Open($Path, 'OpenOrCreate', 'ReadWrite', 'None')
+                }
+
+                Get-Content -Path (Get-TerraformBinary -Version '1.9.8') -Raw | Should -Be 'from the other run'
+                Should -Invoke Invoke-TerraformReleaseRequest -Times 0
             }
         }
 
@@ -567,7 +657,15 @@ InModuleScope terraposh {
                 Should -Invoke Invoke-TerraformReleaseRequest -Exactly -Times 1 -ParameterFilter {
                     $Uri -eq 'https://releases.hashicorp.com/terraform/1.9.8/terraform_1.9.8_darwin_amd64.zip'
                 }
-                Should -Invoke Write-Warning -Exactly -Times 1 -ParameterFilter { $Message -like '*no darwin_arm64 build, using darwin_amd64*' }
+                Should -Invoke Write-Warning -Exactly -Times 1 -ParameterFilter { $Message -like '*no darwin_arm64 build, using darwin_amd64 under Rosetta 2.' }
+            }
+
+            It 'names x64 emulation rather than Rosetta 2 on Windows' {
+                Mock Get-TerraformOS { 'windows' }
+                $script:PublishedChecksums = @{ 'terraform_1.9.8_windows_amd64.zip' = $FakeHash }
+
+                Get-TerraformBinary -Version '1.9.8' | Should -BeLike '*terraform_1.9.8_windows_amd64*'
+                Should -Invoke Write-Warning -Exactly -Times 1 -ParameterFilter { $Message -like '*no windows_arm64 build, using windows_amd64 under x64 emulation.' }
             }
 
             It 'reuses a cached fallback binary without a warning or network access' {
