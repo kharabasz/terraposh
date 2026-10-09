@@ -18,7 +18,9 @@ function Invoke-Terraposh {
         [switch]$Explicit,
         [string]$Version,
         [switch]$CreateHardLink,
-        [switch]$SkipWorkspace
+        [switch]$SkipWorkspace,
+        [ValidateSet('Required', 'Auto', 'Off')]
+        [string]$SignatureVerification
     )
 
     # Push to directory
@@ -39,9 +41,10 @@ function Invoke-Terraposh {
         $SkipWorkspace = $SkipWorkspace -or $Config.SkipWorkspace
 
         $TerraformCommandSplat = @{
-            Version        = [string]::IsNullOrWhiteSpace($Version) ? $Config.TerraformVersion : $Version
-            CreateHardLink = $CreateHardLink
-            SkipWorkspace  = $SkipWorkspace
+            Version               = [string]::IsNullOrWhiteSpace($Version) ? $Config.TerraformVersion : $Version
+            CreateHardLink        = $CreateHardLink
+            SkipWorkspace         = $SkipWorkspace
+            SignatureVerification = [string]::IsNullOrWhiteSpace($SignatureVerification) ? $Config.SignatureVerification : $SignatureVerification
         }
 
         $TerraformCommand = $TerraformCommand.Trim()
@@ -94,10 +97,11 @@ function Invoke-TerraformCommand {
     param (
         [string]$Command,
         [string]$Version,
-        [switch]$CreateHardLink
+        [switch]$CreateHardLink,
+        [string]$SignatureVerification
     )
 
-    $TerraformBinary = Get-TerraformBinary -Version $Version
+    $TerraformBinary = Get-TerraformBinary -Version $Version -SignatureVerification $SignatureVerification
     $TerraformCommand = "${TerraformBinary} ${Command}"
 
     if ($CreateHardLink) {
@@ -277,7 +281,8 @@ function Set-TerraformWorkspace {
         [switch]$PassThru,
         [string]$Version,
         [switch]$CreateHardLink,
-        [switch]$SkipWorkspace
+        [switch]$SkipWorkspace,
+        [string]$SignatureVerification
     )
 
     # short circut if skip
@@ -292,8 +297,9 @@ function Set-TerraformWorkspace {
     $Workspace = $Workspace -replace '[^a-zA-Z0-9\-_]', '_'
 
     $TerraformCommandSplat = @{
-        Version        = $Version
-        CreateHardLink = $CreateHardLink
+        Version               = $Version
+        CreateHardLink        = $CreateHardLink
+        SignatureVerification = $SignatureVerification
     }
     
     Write-Verbose -Message "Workspace name: ${Workspace}"
@@ -404,6 +410,7 @@ function Get-TerraformRelease {
         FileName        = $FileName
         Uri             = "${BaseUri}/${FileName}"
         ChecksumsUri    = "${BaseUri}/terraform_${Version}_SHA256SUMS"
+        SignatureUri    = "${BaseUri}/terraform_${Version}_SHA256SUMS.${HashiCorpKeyId}.sig"
         OutFile         = Join-Path -Path $OutDirectory -ChildPath $FileName
         ExpandDirectory = $ExpandDirectory
         BinaryFile      = Join-Path -Path $ExpandDirectory -ChildPath (Get-TerraformBinaryFileName)
@@ -425,33 +432,270 @@ function Invoke-TerraformReleaseRequest {
         throw "Refusing to download from untrusted location: ${Uri}"
     }
 
-    $RequestSplat = @{
-        Method             = 'Get'
-        Uri                = $ParsedUri
-        MaximumRedirection = 0
+    Invoke-WebRequest -Method Get -Uri $ParsedUri -MaximumRedirection 0 -OutFile $OutFile | Out-Null
+}
+
+function New-TerraposhTemporaryDirectory {
+    $Directory = Join-Path -Path ([System.IO.Path]::GetTempPath()) -ChildPath "terraposh-$([guid]::NewGuid().ToString('N'))"
+    New-Item -Path $Directory -ItemType Directory | Out-Null
+
+    return $Directory
+}
+
+# HashiCorp's release signing key and code signing identities
+# https://www.hashicorp.com/trust/security (the key is also published on keys.openpgp.org)
+$HashiCorpKeyFile = Join-Path -Path $PSScriptRoot -ChildPath 'hashicorp.asc'
+$HashiCorpKeyFingerprint = 'C874011F0AB405110D02105534365D9472D7468F'
+$HashiCorpKeyId = '72D7468F'
+$HashiCorpAppleTeamId = 'D38WU7D763'
+$HashiCorpAuthenticodeSigner = 'HashiCorp, Inc.'
+
+function Get-SignatureVerificationMode {
+    param (
+        [string]$Mode
+    )
+
+    if ([string]::IsNullOrWhiteSpace($Mode)) {
+        return 'Auto'
     }
 
-    if (-not [string]::IsNullOrWhiteSpace($OutFile)) {
-        Invoke-WebRequest @RequestSplat -OutFile $OutFile | Out-Null
-        return
+    $Modes = @('Required', 'Auto', 'Off')
+    $MatchedMode = $Modes | Where-Object { $_ -eq $Mode.Trim() }
+
+    if (-not $MatchedMode) {
+        throw "Invalid SignatureVerification: '${Mode}', expected one of: $($Modes -join ', ')"
     }
 
-    $Response = Invoke-WebRequest @RequestSplat
-    $Content = $Response.Content
+    return $MatchedMode
+}
 
-    if ($Content -is [byte[]]) {
-        $Content = [System.Text.Encoding]::UTF8.GetString($Content)
+function Confirm-SignatureUnavailable {
+    # The signature can't be checked at all (no gpgv, unsigned binary): fail if required, otherwise warn
+    param (
+        [string]$Message,
+        [string]$Mode
+    )
+
+    if ($Mode -eq 'Required') {
+        throw "${Message}, and SignatureVerification is Required."
     }
 
-    return $Content
+    Write-Warning -Message "${Message}, skipping signature verification."
+
+    return 'Unverified'
+}
+
+function ConvertFrom-ArmoredPgpKey {
+    param (
+        [string]$Path
+    )
+
+    $Base64 = [System.Text.StringBuilder]::new()
+    $InHeaders = $false
+    $InBody = $false
+
+    foreach ($Line in (Get-Content -Path $Path)) {
+        $Line = $Line.Trim()
+
+        if ($Line -eq '-----BEGIN PGP PUBLIC KEY BLOCK-----') {
+            $InHeaders = $true
+            continue
+        }
+
+        if ($Line -eq '-----END PGP PUBLIC KEY BLOCK-----') {
+            break
+        }
+
+        # Armor headers end at the first blank line; the "=" line is the CRC
+        if ($InHeaders) {
+            $InHeaders = $Line -ne ''
+            $InBody = -not $InHeaders
+            continue
+        }
+
+        if ($InBody -and -not $Line.StartsWith('=')) {
+            $Base64.Append($Line) | Out-Null
+        }
+    }
+
+    if ($Base64.Length -eq 0) {
+        throw "No PGP public key block found in ${Path}"
+    }
+
+    return [System.Convert]::FromBase64String($Base64.ToString())
+}
+
+function Test-GpgvInstalled {
+    return [bool](Get-Command -Name 'gpgv' -CommandType Application -ErrorAction Ignore)
+}
+
+function Invoke-Gpgv {
+    param (
+        [string]$Keyring,
+        [string]$Signature,
+        [string]$File,
+        [string]$HomeDirectory
+    )
+
+    # Machine-readable status lines go to stdout (--status-fd 1), human-readable output to stderr
+    $Output = & gpgv --homedir $HomeDirectory --status-fd 1 --keyring $Keyring $Signature $File 2>&1
+
+    return @{
+        ExitCode = $LASTEXITCODE
+        Status   = @($Output | Where-Object { $_ -is [string] })
+        Errors   = @($Output | Where-Object { $_ -is [ErrorRecord] } | ForEach-Object { "$_" })
+    }
+}
+
+function Test-TerraformChecksumsSignature {
+    # Linux: verify SHA256SUMS was signed with HashiCorp's release key
+    param (
+        [hashtable]$Release,
+        [string]$ChecksumsFile,
+        [string]$Mode
+    )
+
+    if (-not (Test-GpgvInstalled)) {
+        return Confirm-SignatureUnavailable -Message 'gpgv not found (install the gpgv or gnupg package)' -Mode $Mode
+    }
+
+    $WorkDirectory = New-TerraposhTemporaryDirectory
+
+    try {
+        $Keyring = Join-Path -Path $WorkDirectory -ChildPath 'hashicorp.gpg'
+        $SignatureFile = Join-Path -Path $WorkDirectory -ChildPath 'SHA256SUMS.sig'
+        [System.IO.File]::WriteAllBytes($Keyring, (ConvertFrom-ArmoredPgpKey -Path $HashiCorpKeyFile))
+        Invoke-TerraformReleaseRequest -Uri $Release.SignatureUri -OutFile $SignatureFile
+        $Result = Invoke-Gpgv -Keyring $Keyring -Signature $SignatureFile -File $ChecksumsFile -HomeDirectory $WorkDirectory
+    }
+    finally {
+        Remove-Item -Path $WorkDirectory -Recurse -Force -ErrorAction Ignore
+    }
+
+    # [GNUPG:] VALIDSIG <signing subkey fingerprint> ... <primary key fingerprint>
+    $ValidSignature = $Result.Status | Where-Object {
+        $Fields = $_ -split ' '
+        $Fields[0] -ceq '[GNUPG:]' -and $Fields[1] -ceq 'VALIDSIG' -and $Fields[-1] -ceq $HashiCorpKeyFingerprint
+    }
+
+    if ($Result.ExitCode -ne 0 -or -not $ValidSignature) {
+        throw "PGP signature verification failed for $($Release.ChecksumsUri), refusing to use it.`n$($Result.Errors -join "`n")"
+    }
+
+    Write-Verbose -Message "Verified $($Release.ChecksumsUri) is signed by ${HashiCorpKeyFingerprint}"
+
+    return 'Verified'
+}
+
+function Invoke-Codesign {
+    param (
+        [string[]]$Arguments
+    )
+
+    $Output = & /usr/bin/codesign @Arguments 2>&1 | ForEach-Object { "$_" }
+
+    return @{
+        ExitCode = $LASTEXITCODE
+        Output   = @($Output)
+    }
+}
+
+function Test-TerraformCodesignSignature {
+    # macOS: Developer ID Application certificate for HashiCorp's Apple team, chained to Apple's root
+    param (
+        [string]$BinaryFile,
+        [string]$Mode
+    )
+
+    $Requirement = "=anchor apple generic and certificate 1[field.1.2.840.113635.100.6.2.6] exists and certificate leaf[field.1.2.840.113635.100.6.1.13] exists and certificate leaf[subject.OU] = ${HashiCorpAppleTeamId}"
+    $Result = Invoke-Codesign -Arguments @('--verify', '--strict', '--test-requirement', $Requirement, $BinaryFile)
+
+    if ($Result.ExitCode -eq 0) {
+        Write-Verbose -Message "Verified ${BinaryFile} is code-signed by Apple team ${HashiCorpAppleTeamId}"
+        return 'Verified'
+    }
+
+    if ($Result.Output -match 'code object is not signed at all') {
+        return Confirm-SignatureUnavailable -Message "${BinaryFile} is not code-signed" -Mode $Mode
+    }
+
+    throw "Code signature verification failed for ${BinaryFile}, refusing to use it.`n$($Result.Output -join "`n")"
+}
+
+function Get-TerraformAuthenticodeSignature {
+    param (
+        [string]$Path
+    )
+
+    return Get-AuthenticodeSignature -FilePath $Path
+}
+
+function Test-TerraformAuthenticodeSignature {
+    # Windows: valid Authenticode signature from HashiCorp
+    param (
+        [string]$BinaryFile,
+        [string]$Mode
+    )
+
+    $Signature = Get-TerraformAuthenticodeSignature -Path $BinaryFile
+    $Status = "$($Signature.Status)"
+
+    if ($Status -eq 'NotSigned') {
+        return Confirm-SignatureUnavailable -Message "${BinaryFile} is not Authenticode-signed" -Mode $Mode
+    }
+
+    $Signer = $Signature.SignerCertificate?.GetNameInfo([System.Security.Cryptography.X509Certificates.X509NameType]::SimpleName, $false)
+
+    if ($Status -ne 'Valid' -or $Signer -cne $HashiCorpAuthenticodeSigner) {
+        throw "Authenticode signature verification failed for ${BinaryFile} (status: ${Status}, signer: '${Signer}'), refusing to use it."
+    }
+
+    Write-Verbose -Message "Verified ${BinaryFile} is Authenticode-signed by ${Signer}"
+
+    return 'Verified'
+}
+
+function Test-TerraformBinarySignature {
+    param (
+        [string]$BinaryFile,
+        [string]$Mode
+    )
+
+    switch (Get-TerraformOS) {
+        'darwin' { return Test-TerraformCodesignSignature -BinaryFile $BinaryFile -Mode $Mode }
+        'windows' { return Test-TerraformAuthenticodeSignature -BinaryFile $BinaryFile -Mode $Mode }
+        default { return 'NotApplicable' }
+    }
 }
 
 function Get-TerraformReleaseChecksums {
     param (
-        [hashtable]$Release
+        [hashtable]$Release,
+        [string]$Mode
     )
 
-    $Content = Invoke-TerraformReleaseRequest -Uri $Release.ChecksumsUri
+    $WorkDirectory = New-TerraposhTemporaryDirectory
+
+    try {
+        $ChecksumsFile = Join-Path -Path $WorkDirectory -ChildPath 'SHA256SUMS'
+        Invoke-TerraformReleaseRequest -Uri $Release.ChecksumsUri -OutFile $ChecksumsFile
+
+        # Linux verifies the signed checksums; macOS and Windows verify the binary's code signature after extraction
+        $Signature = 'NotApplicable'
+
+        if ($Mode -eq 'Off') {
+            $Signature = 'Off'
+        }
+        elseif ((Get-TerraformOS) -eq 'linux') {
+            $Signature = Test-TerraformChecksumsSignature -Release $Release -ChecksumsFile $ChecksumsFile -Mode $Mode
+        }
+
+        $Content = Get-Content -Path $ChecksumsFile -Raw
+    }
+    finally {
+        Remove-Item -Path $WorkDirectory -Recurse -Force -ErrorAction Ignore
+    }
+
     $Checksums = @{}
 
     # SHA256SUMS format: "<sha256>  <filename>"
@@ -469,7 +713,10 @@ function Get-TerraformReleaseChecksums {
         $Checksums[$FileName] = $Hash.ToLower()
     }
 
-    return $Checksums
+    return [pscustomobject]@{
+        Checksums = $Checksums
+        Signature = $Signature
+    }
 }
 
 function Test-FileChecksum {
@@ -484,11 +731,32 @@ function Test-FileChecksum {
     return $ActualHash -ceq $ExpectedHash
 }
 
-function Get-TerraformBinary {
+function Test-TerraformVerifiedMarker {
     param (
-        [string]$Version
+        [string]$Path,
+        [string]$Mode
     )
 
+    if (-not (Test-Path -Path $Path)) {
+        return $false
+    }
+
+    $Signature = (Get-Content -Path $Path -Force | Where-Object { $_ -like 'signature=*' } | Select-Object -First 1) -replace '^signature=', ''
+
+    switch ($Mode) {
+        'Required' { return $Signature -eq 'Verified' }
+        'Auto' { return $Signature -in @('Verified', 'Unverified') }
+        default { return $Signature -in @('Verified', 'Unverified', 'Off') }
+    }
+}
+
+function Get-TerraformBinary {
+    param (
+        [string]$Version,
+        [string]$SignatureVerification
+    )
+
+    $Mode = Get-SignatureVerificationMode -Mode $SignatureVerification
     $NativeRelease = Get-TerraformRelease -Version $Version
     $Candidates = @($NativeRelease)
     $FallbackArchitecture = Get-TerraformFallbackArchitecture
@@ -497,14 +765,15 @@ function Get-TerraformBinary {
         $Candidates += Get-TerraformRelease -Version $NativeRelease.Version -Architecture $FallbackArchitecture -IsFallback
     }
 
-    # Already extracted from an archive that passed checksum verification
+    # Already extracted from an archive that passed checksum (and, as configured, signature) verification
     foreach ($Candidate in $Candidates) {
-        if ((Test-Path -Path $Candidate.BinaryFile) -and (Test-Path -Path $Candidate.VerifiedFile)) {
+        if ((Test-Path -Path $Candidate.BinaryFile) -and (Test-TerraformVerifiedMarker -Path $Candidate.VerifiedFile -Mode $Mode)) {
             return $Candidate.BinaryFile
         }
     }
 
-    $Checksums = Get-TerraformReleaseChecksums -Release $NativeRelease
+    $ReleaseChecksums = Get-TerraformReleaseChecksums -Release $NativeRelease -Mode $Mode
+    $Checksums = $ReleaseChecksums.Checksums
     $Release = $Candidates | Where-Object { $Checksums.ContainsKey($_.FileName) } | Select-Object -First 1
 
     if (-not $Release) {
@@ -546,7 +815,21 @@ function Get-TerraformBinary {
     # Discard anything previously extracted without verification
     Remove-Item -Path $ExpandDirectory -Recurse -Force -ErrorAction Ignore
     Expand-Archive -Path $OutFile -DestinationPath $ExpandDirectory -Force | Out-Null
-    Set-Content -Path $VerifiedFile -Value $ExpectedHash -NoNewline
+
+    $Signature = $ReleaseChecksums.Signature
+
+    if ($Signature -eq 'NotApplicable') {
+        try {
+            $Signature = Test-TerraformBinarySignature -BinaryFile $BinaryFile -Mode $Mode
+        }
+        catch {
+            Remove-Item -Path $ExpandDirectory -Recurse -Force -ErrorAction Ignore
+            Remove-Item -Path $OutFile -Force -ErrorAction Ignore
+            throw
+        }
+    }
+
+    Set-Content -Path $VerifiedFile -Value "${ExpectedHash}`nsignature=${Signature}" -NoNewline
 
     return $BinaryFile
 }
@@ -599,7 +882,9 @@ function Invoke-TerraposhPlan {
         [switch]$Explicit,
         [string]$Version,
         [switch]$CreateHardLink,
-        [switch]$SkipWorkspace
+        [switch]$SkipWorkspace,
+        [ValidateSet('Required', 'Auto', 'Off')]
+        [string]$SignatureVerification
     )
 
     $PSBoundParameters.Remove('TerraformCommand') | Out-Null
@@ -616,7 +901,9 @@ function Invoke-TerraposhApply {
         [switch]$Explicit,
         [string]$Version,
         [switch]$CreateHardLink,
-        [switch]$SkipWorkspace
+        [switch]$SkipWorkspace,
+        [ValidateSet('Required', 'Auto', 'Off')]
+        [string]$SignatureVerification
     )
 
     $PSBoundParameters.Remove('TerraformCommand') | Out-Null
@@ -633,7 +920,9 @@ function Invoke-TerraposhDestroy {
         [switch]$Explicit,
         [string]$Version,
         [switch]$CreateHardLink,
-        [switch]$SkipWorkspace
+        [switch]$SkipWorkspace,
+        [ValidateSet('Required', 'Auto', 'Off')]
+        [string]$SignatureVerification
     )
 
     $PSBoundParameters.Remove('TerraformCommand') | Out-Null
@@ -650,7 +939,9 @@ function Invoke-TerraposhDestroyAutoApprove {
         [switch]$Explicit,
         [string]$Version,
         [switch]$CreateHardLink,
-        [switch]$SkipWorkspace
+        [switch]$SkipWorkspace,
+        [ValidateSet('Required', 'Auto', 'Off')]
+        [string]$SignatureVerification
     )
 
     $PSBoundParameters.Remove('TerraformCommand') | Out-Null

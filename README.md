@@ -50,6 +50,7 @@ The config file can contain any number of `TF_CLI_ARGS` and they will all be loa
     "TerraformVersion": "1.6.3",
     "CreateHardLink": true,
     "SkipWorkspace": false,
+    "SignatureVerification": "Required",
     "TF_CLI_ARGS_init": "-backend=true -upgrade=true -backend-config=backend.tfvars -reconfigure",
     "TF_CLI_ARGS_plan": "-detailed-exitcode -parallelism=20 -out=.terraform/plan.bin -var-file=development.tfvars",
     "TF_CLI_ARGS_apply": "-parallelism=20 .terraform/plan.bin",
@@ -64,6 +65,22 @@ The config file can contain any number of `TF_CLI_ARGS` and they will all be loa
 Terraform binaries are vendored under `~/.terraposh/vendored`. Pin `TerraformVersion` in each repository's `.terraposh.config.json`; if no version is set, terraposh warns and resolves the latest release.
 
 Downloads are only made over HTTPS from HashiCorp's official release server (`https://releases.hashicorp.com`), with redirects refused. Every archive is cross-checked against HashiCorp's published `terraform_<version>_SHA256SUMS` before it is extracted. A download that fails verification is discarded and the command fails; a cached archive that fails verification is re-downloaded.
+
+### Signature verification
+
+On top of the checksum check, terraposh verifies that the release really comes from HashiCorp:
+
+| OS | Check | Requires |
+|---|---|---|
+| Linux | `terraform_<version>_SHA256SUMS` is verified with `gpgv` against HashiCorp's release key (bundled as `hashicorp.asc`, fingerprint `C874 011F 0AB4 0511 0D02  1055 3436 5D94 72D7 468F`) before any checksum is trusted | `gpgv` (preinstalled on most distributions; package `gpgv` or `gnupg`) |
+| macOS | The extracted binary must carry a valid Apple Developer ID signature from HashiCorp (team `D38WU7D763`) | nothing (`codesign` is built in) |
+| Windows | The extracted binary must carry a valid Authenticode signature from `HashiCorp, Inc.` | nothing (`Get-AuthenticodeSignature` is built in) |
+
+A signature that is present but invalid, from someone else, or missing on Linux always fails the command. What happens when a signature *can't* be checked (no `gpgv` on Linux, or an unsigned binary on macOS/Windows) is controlled by `SignatureVerification` in `.terraposh.config.json` or the `-SignatureVerification` parameter:
+
+- `Auto` (default): warn and continue
+- `Required`: fail
+- `Off`: skip signature checks (checksums are still verified)
 
 The build matching your OS and CPU architecture is used. On Arm64 macOS and Windows, if a version has no native build (e.g. Terraform < 1.0.2 on Apple Silicon), the `amd64` build is used under emulation (Rosetta 2 on macOS) and a warning is shown.
 
@@ -89,6 +106,7 @@ All functions support the same params.
 [switch]$Explicit         # Used to bypass automatic sequencing of init, workspace, <command> and will instead just run the provided command only
 [string]$Version          # The version of Terraform to run, will automatically be downloaded if not already vendored
 [switch]$CreateHardLink   # If present, Terraposh will automatically create a HardLink to the Terraform vendored binary
+[string]$SignatureVerification # Required, Auto (default) or Off, see Signature verification
 [switch]$SkipWorkspace    # If present, Terraposh will skip the creation of a Terraform workspace during the init, plan, apply, and destroy process
 ```
 
@@ -108,6 +126,7 @@ SYNTAX
         [-Version <string>]
         [-CreateHardLink]
         [-SkipWorkspace]
+        [-SignatureVerification <string>]
 
 ALIASES
     terraposh
@@ -129,6 +148,7 @@ SYNTAX
         [-Version <string>]
         [-CreateHardLink]
         [-SkipWorkspace]
+        [-SignatureVerification <string>]
 
 ALIASES
     tpp
@@ -150,6 +170,7 @@ SYNTAX
         [-Version <string>]
         [-CreateHardLink]
         [-SkipWorkspace]
+        [-SignatureVerification <string>]
 
 ALIASES
     tpa
@@ -171,6 +192,7 @@ SYNTAX
         [-Version <string>]
         [-CreateHardLink]
         [-SkipWorkspace]
+        [-SignatureVerification <string>]
 
 ALIASES
     tpd
@@ -192,6 +214,7 @@ SYNTAX
         [-Version <string>]
         [-CreateHardLink]
         [-SkipWorkspace]
+        [-SignatureVerification <string>]
 
 ALIASES
     tpda
