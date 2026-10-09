@@ -350,9 +350,22 @@ function Get-TerraformArchitecture {
     }
 }
 
+function Get-TerraformFallbackArchitecture {
+    # Arm64 macOS (Rosetta 2) and Windows can run amd64 builds, e.g. Terraform < 1.0.2 has no darwin_arm64 build
+    $Architecture = Get-TerraformArchitecture
+
+    if ($Architecture -eq 'arm64' -and ($IsMacOS -or $IsWindows)) {
+        return 'amd64'
+    }
+
+    return $null
+}
+
 function Get-TerraformRelease {
     param (
-        [string]$Version
+        [string]$Version,
+        [string]$Architecture,
+        [switch]$IsFallback
     )
 
     if ([string]::IsNullOrWhiteSpace($Version)) {
@@ -368,15 +381,25 @@ function Get-TerraformRelease {
     }
 
     $OSPart = $IsWindows ? 'windows' : ($IsMacOS ? 'darwin' : 'linux')
-    $ArchPart = Get-TerraformArchitecture
-    $FileName = "terraform_${Version}_${OSPart}_${ArchPart}.zip"
+    $ArchPart = [string]::IsNullOrWhiteSpace($Architecture) ? (Get-TerraformArchitecture) : $Architecture
+    $Platform = "${OSPart}_${ArchPart}"
+    $FileName = "terraform_${Version}_${Platform}.zip"
     $BaseUri = "https://releases.hashicorp.com/terraform/${Version}"
+    $OutDirectory = Set-TerraformVendoredDirectory
+    $ExpandDirectory = Join-Path -Path $OutDirectory -ChildPath ([System.IO.Path]::GetFileNameWithoutExtension($FileName))
 
     return @{
-        Version      = $Version
-        FileName     = $FileName
-        Uri          = "${BaseUri}/${FileName}"
-        ChecksumsUri = "${BaseUri}/terraform_${Version}_SHA256SUMS"
+        Version         = $Version
+        Platform        = $Platform
+        IsFallback      = [bool]$IsFallback
+        FileName        = $FileName
+        Uri             = "${BaseUri}/${FileName}"
+        ChecksumsUri    = "${BaseUri}/terraform_${Version}_SHA256SUMS"
+        OutFile         = Join-Path -Path $OutDirectory -ChildPath $FileName
+        ExpandDirectory = $ExpandDirectory
+        BinaryFile      = Join-Path -Path $ExpandDirectory -ChildPath (Get-TerraformBinaryFileName)
+        # Separate marker for fallback builds, so they're never preferred over a published native build
+        VerifiedFile    = Join-Path -Path $ExpandDirectory -ChildPath ($IsFallback ? '.terraposh-sha256-fallback' : '.terraposh-sha256')
     }
 }
 
@@ -414,29 +437,30 @@ function Invoke-TerraformReleaseRequest {
     return $Content
 }
 
-function Get-TerraformReleaseChecksum {
+function Get-TerraformReleaseChecksums {
     param (
         [hashtable]$Release
     )
 
-    $Checksums = Invoke-TerraformReleaseRequest -Uri $Release.ChecksumsUri
+    $Content = Invoke-TerraformReleaseRequest -Uri $Release.ChecksumsUri
+    $Checksums = @{}
 
     # SHA256SUMS format: "<sha256>  <filename>"
-    $ChecksumLines = $Checksums -split "`n" | `
-        ForEach-Object { $_.Trim() } | `
-        Where-Object { ($_ -split '\s+', 2)[1] -ceq $Release.FileName }
+    foreach ($Line in ($Content -split "`n")) {
+        $Hash, $FileName = $Line.Trim() -split '\s+', 2
 
-    if (@($ChecksumLines).Count -ne 1) {
-        throw "No published SHA-256 checksum for $($Release.FileName) in $($Release.ChecksumsUri), this version may not be built for this OS/architecture"
+        if ([string]::IsNullOrWhiteSpace($FileName)) {
+            continue
+        }
+
+        if ($Hash -notmatch '^[0-9a-fA-F]{64}$' -or $Checksums.ContainsKey($FileName)) {
+            throw "Malformed SHA256SUMS entry in $($Release.ChecksumsUri): ${Line}"
+        }
+
+        $Checksums[$FileName] = $Hash.ToLower()
     }
 
-    $Hash = ($ChecksumLines -split '\s+', 2)[0]
-
-    if ($Hash -notmatch '^[0-9a-fA-F]{64}$') {
-        throw "Malformed SHA-256 checksum for $($Release.FileName): ${Hash}"
-    }
-
-    return $Hash.ToLower()
+    return $Checksums
 }
 
 function Test-FileChecksum {
@@ -456,20 +480,37 @@ function Get-TerraformBinary {
         [string]$Version
     )
 
-    $Release = Get-TerraformRelease -Version $Version
-    $OutDirectory = Set-TerraformVendoredDirectory
-    $OutFile = Join-Path -Path $OutDirectory -ChildPath $Release.FileName
-    $ExpandDirectory = Join-Path -Path $OutDirectory -ChildPath ([System.IO.Path]::GetFileNameWithoutExtension($Release.FileName))
-    $BinaryFileName = Get-TerraformBinaryFileName
-    $BinaryFile = Join-Path -Path $ExpandDirectory -ChildPath $BinaryFileName
-    $VerifiedFile = Join-Path -Path $ExpandDirectory -ChildPath '.terraposh-sha256'
+    $NativeRelease = Get-TerraformRelease -Version $Version
+    $Candidates = @($NativeRelease)
+    $FallbackArchitecture = Get-TerraformFallbackArchitecture
 
-    # Already extracted from an archive that passed checksum verification
-    if ((Test-Path -Path $BinaryFile) -and (Test-Path -Path $VerifiedFile)) {
-        return $BinaryFile
+    if ($FallbackArchitecture) {
+        $Candidates += Get-TerraformRelease -Version $NativeRelease.Version -Architecture $FallbackArchitecture -IsFallback
     }
 
-    $ExpectedHash = Get-TerraformReleaseChecksum -Release $Release
+    # Already extracted from an archive that passed checksum verification
+    foreach ($Candidate in $Candidates) {
+        if ((Test-Path -Path $Candidate.BinaryFile) -and (Test-Path -Path $Candidate.VerifiedFile)) {
+            return $Candidate.BinaryFile
+        }
+    }
+
+    $Checksums = Get-TerraformReleaseChecksums -Release $NativeRelease
+    $Release = $Candidates | Where-Object { $Checksums.ContainsKey($_.FileName) } | Select-Object -First 1
+
+    if (-not $Release) {
+        throw "Terraform $($NativeRelease.Version) has no published build for $($NativeRelease.Platform) in $($NativeRelease.ChecksumsUri)"
+    }
+
+    if ($Release.IsFallback) {
+        Write-Warning -Message "Terraform $($Release.Version) has no $($NativeRelease.Platform) build, using $($Release.Platform) under emulation (Rosetta 2 on macOS)."
+    }
+
+    $ExpectedHash = $Checksums[$Release.FileName]
+    $OutFile = $Release.OutFile
+    $ExpandDirectory = $Release.ExpandDirectory
+    $BinaryFile = $Release.BinaryFile
+    $VerifiedFile = $Release.VerifiedFile
 
     if ((Test-Path -Path $OutFile) -and -not (Test-FileChecksum -Path $OutFile -ExpectedHash $ExpectedHash)) {
         Write-Warning -Message "Cached archive failed SHA-256 verification, re-downloading: ${OutFile}"

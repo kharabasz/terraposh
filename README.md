@@ -65,6 +65,8 @@ Terraform binaries are vendored under `~/.terraposh/vendored`. Pin `TerraformVer
 
 Downloads are only made over HTTPS from HashiCorp's official release server (`https://releases.hashicorp.com`), with redirects refused. Every archive is cross-checked against HashiCorp's published `terraform_<version>_SHA256SUMS` before it is extracted. A download that fails verification is discarded and the command fails; a cached archive that fails verification is re-downloaded.
 
+The build matching your OS and CPU architecture is used. On Arm64 macOS and Windows, if a version has no native build (e.g. Terraform < 1.0.2 on Apple Silicon), the `amd64` build is used under emulation (Rosetta 2 on macOS) and a warning is shown.
+
 ## Commands
 
 All functions support the same params.
