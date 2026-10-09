@@ -343,7 +343,6 @@ function Get-TerraformOS {
 
 function Get-TerraformArchitecture {
     param (
-        # OS architecture (not process), so an x64 pwsh under Rosetta/emulation still gets the native build
         [string]$Architecture = [System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture
     )
 
@@ -362,7 +361,6 @@ function Get-TerraformFallbackArchitecture {
         [string]$Architecture = (Get-TerraformArchitecture)
     )
 
-    # Arm64 macOS (Rosetta 2) and Windows can run amd64 builds, e.g. Terraform < 1.0.2 has no darwin_arm64 build
     if ($Architecture -eq 'arm64' -and $OS -in @('darwin', 'windows')) {
         return 'amd64'
     }
@@ -384,7 +382,6 @@ function Get-TerraformRelease {
 
     $Version = $Version.Trim().TrimStart('v')
 
-    # Only allow semver-shaped versions so the value can't alter the release URI path
     if ($Version -notmatch '^\d+\.\d+\.\d+(-[0-9A-Za-z.]+)?$') {
         throw "Invalid Terraform version: '${Version}'"
     }
@@ -408,7 +405,6 @@ function Get-TerraformRelease {
         OutFile         = Join-Path -Path $OutDirectory -ChildPath $FileName
         ExpandDirectory = $ExpandDirectory
         BinaryFile      = Join-Path -Path $ExpandDirectory -ChildPath (Get-TerraformBinaryFileName)
-        # Separate marker for fallback builds, so they're never preferred over a published native build
         VerifiedFile    = Join-Path -Path $ExpandDirectory -ChildPath ($IsFallback ? '.terraposh-sha256-fallback' : '.terraposh-sha256')
     }
 }
@@ -419,7 +415,6 @@ function Invoke-TerraformReleaseRequest {
         [string]$OutFile
     )
 
-    # Only ever talk to HashiCorp's official release server over HTTPS
     $ParsedUri = [uri]$Uri
 
     if ($ParsedUri.Scheme -ne 'https' -or $ParsedUri.Host -ne 'releases.hashicorp.com') {
@@ -436,8 +431,6 @@ function New-TerraposhTemporaryDirectory {
     return $Directory
 }
 
-# HashiCorp's release signing key and code signing identities
-# https://www.hashicorp.com/trust/security (the key is also published on keys.openpgp.org)
 $HashiCorpKeyFile = Join-Path -Path $PSScriptRoot -ChildPath 'hashicorp.asc'
 $HashiCorpKeyFingerprint = 'C874011F0AB405110D02105534365D9472D7468F'
 $HashiCorpKeyId = '72D7468F'
@@ -465,7 +458,6 @@ function ConvertFrom-ArmoredPgpKey {
             break
         }
 
-        # Armor headers end at the first blank line; the "=" line is the CRC
         if ($InHeaders) {
             $InHeaders = $Line -ne ''
             $InBody = -not $InHeaders
@@ -496,7 +488,6 @@ function Invoke-Gpgv {
         [string]$HomeDirectory
     )
 
-    # Machine-readable status lines go to stdout (--status-fd 1), human-readable output to stderr
     $Output = & gpgv --homedir $HomeDirectory --status-fd 1 --keyring $Keyring $Signature $File 2>&1
 
     return @{
@@ -507,7 +498,6 @@ function Invoke-Gpgv {
 }
 
 function Assert-TerraformChecksumsSignature {
-    # Linux: verify SHA256SUMS was signed with HashiCorp's release key
     param (
         [hashtable]$Release,
         [string]$ChecksumsFile
@@ -530,7 +520,6 @@ function Assert-TerraformChecksumsSignature {
         Remove-Item -Path $WorkDirectory -Recurse -Force -ErrorAction Ignore
     }
 
-    # [GNUPG:] VALIDSIG <signing subkey fingerprint> ... <primary key fingerprint>
     $ValidSignature = $Result.Status | Where-Object {
         $Fields = $_ -split ' '
         $Fields[0] -ceq '[GNUPG:]' -and $Fields[1] -ceq 'VALIDSIG' -and $Fields[-1] -ceq $HashiCorpKeyFingerprint
@@ -557,7 +546,6 @@ function Invoke-Codesign {
 }
 
 function Assert-TerraformCodesignSignature {
-    # macOS: Developer ID Application certificate for HashiCorp's Apple team, chained to Apple's root
     param (
         [string]$BinaryFile
     )
@@ -581,7 +569,6 @@ function Get-TerraformAuthenticodeSignature {
 }
 
 function Assert-TerraformAuthenticodeSignature {
-    # Windows: valid Authenticode signature from HashiCorp
     param (
         [string]$BinaryFile
     )
@@ -598,7 +585,6 @@ function Assert-TerraformAuthenticodeSignature {
 }
 
 function Assert-TerraformBinarySignature {
-    # macOS and Windows verify the binary's code signature; Linux verified the signed checksums instead
     param (
         [string]$BinaryFile
     )
@@ -620,7 +606,6 @@ function Get-TerraformReleaseChecksums {
         $ChecksumsFile = Join-Path -Path $WorkDirectory -ChildPath 'SHA256SUMS'
         Invoke-TerraformReleaseRequest -Uri $Release.ChecksumsUri -OutFile $ChecksumsFile
 
-        # Linux verifies the signed checksums; macOS and Windows verify the binary's code signature after extraction
         if ((Get-TerraformOS) -eq 'linux') {
             Assert-TerraformChecksumsSignature -Release $Release -ChecksumsFile $ChecksumsFile
         }
@@ -633,7 +618,6 @@ function Get-TerraformReleaseChecksums {
 
     $Checksums = @{}
 
-    # SHA256SUMS format: "<sha256>  <filename>"
     foreach ($Line in ($Content -split "`n")) {
         $Hash, $FileName = $Line.Trim() -split '\s+', 2
 
@@ -664,7 +648,6 @@ function Test-FileChecksum {
 }
 
 function Test-TerraformVerifiedMarker {
-    # Markers written before signature verification existed only hold the hash, so they aren't trusted
     param (
         [string]$Path
     )
@@ -689,7 +672,6 @@ function Get-TerraformBinary {
         $Candidates += Get-TerraformRelease -Version $NativeRelease.Version -Architecture $FallbackArchitecture -IsFallback
     }
 
-    # Already extracted from an archive that passed checksum and signature verification
     foreach ($Candidate in $Candidates) {
         if ((Test-Path -Path $Candidate.BinaryFile) -and (Test-TerraformVerifiedMarker -Path $Candidate.VerifiedFile)) {
             return $Candidate.BinaryFile
@@ -735,7 +717,6 @@ function Get-TerraformBinary {
         }
     }
 
-    # Discard anything previously extracted without verification
     Remove-Item -Path $ExpandDirectory -Recurse -Force -ErrorAction Ignore
     Expand-Archive -Path $OutFile -DestinationPath $ExpandDirectory -Force | Out-Null
 

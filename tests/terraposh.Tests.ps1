@@ -173,7 +173,6 @@ InModuleScope terraposh {
         It 'verifies the downloaded checksum file signature on linux before parsing it' {
             Mock Get-TerraformOS { 'linux' }
             Mock Assert-TerraformChecksumsSignature {
-                # The exact downloaded bytes are handed to gpgv
                 Get-Content -Path $ChecksumsFile -Raw | Should -Be $script:Sums
             }
 
@@ -200,7 +199,6 @@ InModuleScope terraposh {
         It 'decodes the bundled HashiCorp key to the pinned fingerprint' {
             $Bytes = ConvertFrom-ArmoredPgpKey -Path $HashiCorpKeyFile
 
-            # v4 fingerprint = SHA-1 over the primary public key packet (0x99, 2-byte length, body)
             $Bytes[0] | Should -Be 0x99
             $PacketLength = 3 + ([int]$Bytes[1] -shl 8) + $Bytes[2]
             $Fingerprint = [System.Convert]::ToHexString([System.Security.Cryptography.SHA1]::HashData([byte[]]$Bytes[0..($PacketLength - 1)]))
@@ -446,7 +444,6 @@ InModuleScope terraposh {
 
     Describe 'Get-TerraformBinary' {
         BeforeAll {
-            # Fake release archive containing a "terraform" binary
             $BinaryFileName = Get-TerraformBinaryFileName
             $SourceDirectory = Join-Path -Path $TestDrive -ChildPath 'source'
             New-Item -Path $SourceDirectory -ItemType Directory | Out-Null
@@ -630,7 +627,6 @@ InModuleScope terraposh {
             }
 
             It 'does not reuse a natively verified amd64 binary as a fallback' {
-                # A ".terraposh-sha256" marker under darwin_amd64 was written before the architecture fix
                 $LegacyDirectory = Get-VendoredPath 'terraform_1.9.8_darwin_amd64'
                 New-Item -Path $LegacyDirectory -ItemType Directory | Out-Null
                 Set-Content -Path (Join-Path -Path $LegacyDirectory -ChildPath $BinaryFileName) -Value 'legacy'
@@ -642,7 +638,6 @@ InModuleScope terraposh {
     }
 
     Describe 'Signature verification against releases.hashicorp.com' -Tag 'Integration' {
-        # Evaluated during discovery for -Skip
         $DiscoveryOS = Get-TerraformOS
         $DiscoveryGpgv = Test-GpgvInstalled
 
@@ -665,7 +660,6 @@ InModuleScope terraposh {
             Test-Path -Path $Binary | Should -BeTrue
             Get-Content -Path (Join-Path -Path (Split-Path -Parent $Binary) -ChildPath '.terraposh-sha256*') -Force | Should -Contain 'signature=Verified'
 
-            # Native build, or the emulated amd64 build when none is published (e.g. windows_arm64)
             $Platform = (Split-Path -Leaf (Split-Path -Parent $Binary)) -replace "^terraform_${Version}_", ''
             $ExpectedPlatforms = @("${OS}_$(Get-TerraformArchitecture)")
             $FallbackArchitecture = Get-TerraformFallbackArchitecture
@@ -724,7 +718,6 @@ InModuleScope terraposh {
             }
 
             It 'rejects a validly signed binary from another publisher' {
-                # pwsh is signed by Microsoft
                 { Assert-TerraformBinarySignature -BinaryFile $OtherPublisherBinary } | Should -Throw '*signature verification failed*'
             }
         }
