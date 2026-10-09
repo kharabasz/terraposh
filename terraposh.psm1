@@ -481,15 +481,40 @@ function Get-GpgvPath {
         return $Command.Source
     }
 
-    if ((Get-TerraformOS) -eq 'windows' -and -not [string]::IsNullOrWhiteSpace($env:ProgramFiles)) {
-        $GitGpgv = Join-Path -Path $env:ProgramFiles -ChildPath 'Git' -AdditionalChildPath 'usr', 'bin', 'gpgv.exe'
+    if ((Get-TerraformOS) -ne 'windows') {
+        return $null
+    }
 
-        if (Test-Path -Path $GitGpgv -PathType Leaf) {
-            return $GitGpgv
+    $Candidates = [ArrayList]::new()
+    $Git = Get-Command -Name 'git' -CommandType Application -ErrorAction Ignore | Select-Object -First 1
+
+    if ($Git) {
+        $Directory = Split-Path -Parent $Git.Source
+
+        for ($Level = 0; $Level -lt 3 -and -not [string]::IsNullOrWhiteSpace($Directory); $Level++) {
+            $Candidates.Add((Join-Path -Path $Directory -ChildPath 'usr' -AdditionalChildPath 'bin', 'gpgv.exe')) | Out-Null
+            $Directory = Split-Path -Parent $Directory
         }
     }
 
-    return $null
+    $ScoopRoot = [string]::IsNullOrWhiteSpace($env:SCOOP) ? ([string]::IsNullOrWhiteSpace($env:USERPROFILE) ? $null : (Join-Path -Path $env:USERPROFILE -ChildPath 'scoop')) : $env:SCOOP
+    $GitRoots = @(
+        $env:ProgramW6432 ? (Join-Path -Path $env:ProgramW6432 -ChildPath 'Git') : $null
+        $env:ProgramFiles ? (Join-Path -Path $env:ProgramFiles -ChildPath 'Git') : $null
+        ${env:ProgramFiles(x86)} ? (Join-Path -Path ${env:ProgramFiles(x86)} -ChildPath 'Git') : $null
+        $env:LOCALAPPDATA ? (Join-Path -Path $env:LOCALAPPDATA -ChildPath 'Programs' -AdditionalChildPath 'Git') : $null
+        $ScoopRoot ? (Join-Path -Path $ScoopRoot -ChildPath 'apps' -AdditionalChildPath 'git', 'current') : $null
+    )
+
+    foreach ($GitRoot in ($GitRoots | Where-Object { $_ })) {
+        $Candidates.Add((Join-Path -Path $GitRoot -ChildPath 'usr' -AdditionalChildPath 'bin', 'gpgv.exe')) | Out-Null
+    }
+
+    foreach ($ProgramFiles in (@(${env:ProgramFiles(x86)}, $env:ProgramW6432, $env:ProgramFiles) | Where-Object { $_ })) {
+        $Candidates.Add((Join-Path -Path $ProgramFiles -ChildPath 'GnuPG' -AdditionalChildPath 'bin', 'gpgv.exe')) | Out-Null
+    }
+
+    return $Candidates | Where-Object { Test-Path -Path $_ -PathType Leaf } | Select-Object -First 1
 }
 
 function Invoke-Gpgv {

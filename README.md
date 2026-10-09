@@ -75,7 +75,7 @@ Verification always runs and can't be turned off. The command fails if the signa
 |---|---|
 | Linux | Preinstalled on most distributions; otherwise the `gpgv` or `gnupg` package |
 | macOS | `brew install gnupg` |
-| Windows | [Gpg4win](https://gpg4win.org), or [Git for Windows](https://gitforwindows.org), whose `gpgv.exe` is used automatically if `gpgv` isn't on `PATH` |
+| Windows | [Gpg4win](https://gpg4win.org) or [Git for Windows](https://gitforwindows.org). If `gpgv` isn't on `PATH`, terraposh looks next to the `git` on `PATH`, then in the usual Git for Windows locations (Program Files, a per-user install under `%LOCALAPPDATA%\Programs\Git`, Scoop) and Gpg4win's `GnuPG\bin` |
 
 The build matching your OS and CPU architecture is used. On Arm64 macOS and Windows, if a version has no native build (e.g. Terraform < 1.0.2 on Apple Silicon), the `amd64` build is used under emulation (Rosetta 2 on macOS) and a warning is shown.
 

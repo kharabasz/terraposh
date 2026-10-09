@@ -240,36 +240,99 @@ InModuleScope terraposh {
         }
 
         Context 'gpgv not on PATH' {
+            BeforeAll {
+                $EnvironmentNames = @('ProgramW6432', 'ProgramFiles', 'ProgramFiles(x86)', 'LOCALAPPDATA', 'SCOOP', 'USERPROFILE')
+
+                function New-FakeFile([string]$Path) {
+                    New-Item -Path $Path -ItemType File -Force | Out-Null
+                    return $Path
+                }
+            }
+
             BeforeEach {
                 Mock Get-Command { $null } -ParameterFilter { $Name -eq 'gpgv' }
-                $script:ProgramFiles = $env:ProgramFiles
-                $env:ProgramFiles = Join-Path -Path $TestDrive -ChildPath "Program Files $([guid]::NewGuid())"
+                Mock Get-Command { $null } -ParameterFilter { $Name -eq 'git' }
+                Mock Get-TerraformOS { 'windows' }
+
+                $script:SavedEnvironment = @{}
+                $Root = Join-Path -Path $TestDrive -ChildPath ([guid]::NewGuid())
+
+                foreach ($EnvironmentName in $EnvironmentNames) {
+                    $script:SavedEnvironment[$EnvironmentName] = [Environment]::GetEnvironmentVariable($EnvironmentName)
+                    [Environment]::SetEnvironmentVariable($EnvironmentName, $null)
+                }
+
+                $env:ProgramW6432 = Join-Path -Path $Root -ChildPath 'Program Files'
+                $env:ProgramFiles = Join-Path -Path $Root -ChildPath 'Program Files'
+                ${env:ProgramFiles(x86)} = Join-Path -Path $Root -ChildPath 'Program Files (x86)'
+                $env:LOCALAPPDATA = Join-Path -Path $Root -ChildPath 'AppData' -AdditionalChildPath 'Local'
+                $env:USERPROFILE = Join-Path -Path $Root -ChildPath 'User'
             }
 
             AfterEach {
-                $env:ProgramFiles = $script:ProgramFiles
+                foreach ($EnvironmentName in $EnvironmentNames) {
+                    [Environment]::SetEnvironmentVariable($EnvironmentName, $script:SavedEnvironment[$EnvironmentName])
+                }
             }
 
-            It 'falls back to Git for Windows'' gpgv on Windows' {
-                Mock Get-TerraformOS { 'windows' }
-                $GitGpgv = Join-Path -Path $env:ProgramFiles -ChildPath 'Git' -AdditionalChildPath 'usr', 'bin', 'gpgv.exe'
-                New-Item -Path $GitGpgv -ItemType File -Force | Out-Null
+            It 'finds Git for Windows'' gpgv next to git on PATH (<Layout>)' -TestCases @(
+                @{ Layout = 'cmd'; GitRelative = 'cmd' }
+                @{ Layout = 'bin'; GitRelative = 'bin' }
+                @{ Layout = 'mingw64\bin'; GitRelative = 'mingw64/bin' }
+            ) {
+                $GitRoot = Join-Path -Path $TestDrive -ChildPath "Custom Git $([guid]::NewGuid())"
+                $GitExe = New-FakeFile (Join-Path -Path $GitRoot -ChildPath $GitRelative -AdditionalChildPath 'git.exe')
+                $Gpgv = New-FakeFile (Join-Path -Path $GitRoot -ChildPath 'usr' -AdditionalChildPath 'bin', 'gpgv.exe')
+                Mock Get-Command { [pscustomobject]@{ Source = $GitExe } } -ParameterFilter { $Name -eq 'git' }
 
-                Get-GpgvPath | Should -Be $GitGpgv
+                Get-GpgvPath | Should -Be $Gpgv
             }
 
-            It 'returns nothing on Windows without Git for Windows' {
-                Mock Get-TerraformOS { 'windows' }
+            It 'finds gpgv in <Location>' -TestCases @(
+                @{ Location = 'Program Files\Git'; Relative = { Join-Path -Path $env:ProgramFiles -ChildPath 'Git' -AdditionalChildPath 'usr', 'bin', 'gpgv.exe' } }
+                @{ Location = 'Program Files (x86)\Git'; Relative = { Join-Path -Path ${env:ProgramFiles(x86)} -ChildPath 'Git' -AdditionalChildPath 'usr', 'bin', 'gpgv.exe' } }
+                @{ Location = 'a per-user Git install'; Relative = { Join-Path -Path $env:LOCALAPPDATA -ChildPath 'Programs' -AdditionalChildPath 'Git', 'usr', 'bin', 'gpgv.exe' } }
+                @{ Location = 'Scoop under the user profile'; Relative = { Join-Path -Path $env:USERPROFILE -ChildPath 'scoop' -AdditionalChildPath 'apps', 'git', 'current', 'usr', 'bin', 'gpgv.exe' } }
+                @{ Location = 'Gpg4win'; Relative = { Join-Path -Path ${env:ProgramFiles(x86)} -ChildPath 'GnuPG' -AdditionalChildPath 'bin', 'gpgv.exe' } }
+            ) {
+                $Gpgv = New-FakeFile (& $Relative)
+
+                Get-GpgvPath | Should -Be $Gpgv
+            }
+
+            It 'finds gpgv in a custom Scoop root' {
+                $env:SCOOP = Join-Path -Path $TestDrive -ChildPath "scoop $([guid]::NewGuid())"
+                $Gpgv = New-FakeFile (Join-Path -Path $env:SCOOP -ChildPath 'apps' -AdditionalChildPath 'git', 'current', 'usr', 'bin', 'gpgv.exe')
+
+                Get-GpgvPath | Should -Be $Gpgv
+            }
+
+            It 'prefers the Git next to git on PATH over a Program Files install' {
+                New-FakeFile (Join-Path -Path $env:ProgramFiles -ChildPath 'Git' -AdditionalChildPath 'usr', 'bin', 'gpgv.exe') | Out-Null
+                $GitRoot = Join-Path -Path $TestDrive -ChildPath "Custom Git $([guid]::NewGuid())"
+                $GitExe = New-FakeFile (Join-Path -Path $GitRoot -ChildPath 'cmd' -AdditionalChildPath 'git.exe')
+                $Gpgv = New-FakeFile (Join-Path -Path $GitRoot -ChildPath 'usr' -AdditionalChildPath 'bin', 'gpgv.exe')
+                Mock Get-Command { [pscustomobject]@{ Source = $GitExe } } -ParameterFilter { $Name -eq 'git' }
+
+                Get-GpgvPath | Should -Be $Gpgv
+            }
+
+            It 'ignores a directory named gpgv.exe' {
+                New-Item -Path (Join-Path -Path $env:ProgramFiles -ChildPath 'Git' -AdditionalChildPath 'usr', 'bin', 'gpgv.exe') -ItemType Directory -Force | Out-Null
 
                 Get-GpgvPath | Should -BeNullOrEmpty
             }
 
-            It 'does not look for Git for Windows on <OS>' -TestCases @(
+            It 'returns nothing on Windows when no gpgv is installed' {
+                Get-GpgvPath | Should -BeNullOrEmpty
+            }
+
+            It 'does not search Windows locations on <OS>' -TestCases @(
                 @{ OS = 'linux' }
                 @{ OS = 'darwin' }
             ) {
                 Mock Get-TerraformOS { $OS }
-                New-Item -Path (Join-Path -Path $env:ProgramFiles -ChildPath 'Git' -AdditionalChildPath 'usr', 'bin', 'gpgv.exe') -ItemType File -Force | Out-Null
+                New-FakeFile (Join-Path -Path $env:ProgramFiles -ChildPath 'Git' -AdditionalChildPath 'usr', 'bin', 'gpgv.exe') | Out-Null
 
                 Get-GpgvPath | Should -BeNullOrEmpty
             }
