@@ -454,29 +454,58 @@ InModuleScope terraposh {
         }
     }
 
-    Describe 'Test-TerraformVerifiedMarker' {
-        BeforeAll {
-            $Marker = Join-Path -Path $TestDrive -ChildPath '.terraposh-sha256'
+    Describe 'Get-TerraformCachedBinaryStatus' {
+        BeforeEach {
+            Reset-TerraformBinaryVerificationCache
+            $Directory = Join-Path -Path $TestDrive -ChildPath ([guid]::NewGuid())
+            New-Item -Path $Directory -ItemType Directory | Out-Null
+            $Binary = Join-Path -Path $Directory -ChildPath 'terraform'
+            $Marker = Join-Path -Path $Directory -ChildPath '.terraposh-sha256'
+            Set-Content -Path $Binary -Value 'terraform' -NoNewline
+            $BinaryHash = (Get-FileHash -Path $Binary -Algorithm SHA256).Hash.ToLower()
         }
 
-        It 'trusts a marker recording a verified signature' {
-            Set-Content -Path $Marker -Value "$('a' * 64)`nsignature=Verified" -NoNewline
+        It 'is Valid when the binary matches the recorded hash' {
+            Set-Content -Path $Marker -Value "$('a' * 64)`nsignature=Verified`nbinary=${BinaryHash}" -NoNewline
 
-            Test-TerraformVerifiedMarker -Path $Marker | Should -BeTrue
+            Get-TerraformCachedBinaryStatus -BinaryFile $Binary -VerifiedFile $Marker | Should -Be 'Valid'
         }
 
-        It 'does not trust <Case>' -TestCases @(
+        It 'is Modified when the binary no longer matches the recorded hash' {
+            Set-Content -Path $Marker -Value "$('a' * 64)`nsignature=Verified`nbinary=${BinaryHash}" -NoNewline
+            Set-Content -Path $Binary -Value 'tampered' -NoNewline
+
+            Get-TerraformCachedBinaryStatus -BinaryFile $Binary -VerifiedFile $Marker | Should -Be 'Modified'
+        }
+
+        It 'is Missing for <Case>' -TestCases @(
             @{ Case = 'a hash-only marker from before signature checks'; Content = ('a' * 64) }
-            @{ Case = 'an unverified signature'; Content = "$('a' * 64)`nsignature=Unverified" }
-            @{ Case = 'signatures turned off'; Content = "$('a' * 64)`nsignature=Off" }
+            @{ Case = 'a marker without a binary hash'; Content = "$('a' * 64)`nsignature=Verified" }
+            @{ Case = 'an unverified signature'; Content = "$('a' * 64)`nsignature=Unverified`nbinary=BINARY" }
+            @{ Case = 'signatures turned off'; Content = "$('a' * 64)`nsignature=Off`nbinary=BINARY" }
+            @{ Case = 'a malformed binary hash'; Content = "$('a' * 64)`nsignature=Verified`nbinary=xyz" }
         ) {
-            Set-Content -Path $Marker -Value $Content -NoNewline
+            Set-Content -Path $Marker -Value ($Content -replace 'BINARY', $BinaryHash) -NoNewline
 
-            Test-TerraformVerifiedMarker -Path $Marker | Should -BeFalse
+            Get-TerraformCachedBinaryStatus -BinaryFile $Binary -VerifiedFile $Marker | Should -Be 'Missing'
         }
 
-        It 'returns false when there is no marker' {
-            Test-TerraformVerifiedMarker -Path (Join-Path -Path $TestDrive -ChildPath 'missing') | Should -BeFalse
+        It 'is Missing without a marker or without a binary' {
+            Get-TerraformCachedBinaryStatus -BinaryFile $Binary -VerifiedFile $Marker | Should -Be 'Missing'
+
+            Set-Content -Path $Marker -Value "$('a' * 64)`nsignature=Verified`nbinary=${BinaryHash}" -NoNewline
+            Remove-Item -Path $Binary
+            Get-TerraformCachedBinaryStatus -BinaryFile $Binary -VerifiedFile $Marker | Should -Be 'Missing'
+        }
+
+        It 'hashes a binary only once until the cache is reset' {
+            Set-Content -Path $Marker -Value "$('a' * 64)`nsignature=Verified`nbinary=${BinaryHash}" -NoNewline
+            Get-TerraformCachedBinaryStatus -BinaryFile $Binary -VerifiedFile $Marker | Should -Be 'Valid'
+            Set-Content -Path $Binary -Value 'tampered' -NoNewline
+
+            Get-TerraformCachedBinaryStatus -BinaryFile $Binary -VerifiedFile $Marker | Should -Be 'Valid'
+            Reset-TerraformBinaryVerificationCache
+            Get-TerraformCachedBinaryStatus -BinaryFile $Binary -VerifiedFile $Marker | Should -Be 'Modified'
         }
     }
 
@@ -600,6 +629,17 @@ InModuleScope terraposh {
             $FakeArchive = Join-Path -Path $TestDrive -ChildPath 'terraform.zip'
             Compress-Archive -Path (Join-Path -Path $SourceDirectory -ChildPath $BinaryFileName) -DestinationPath $FakeArchive
             $FakeHash = (Get-FileHash -Path $FakeArchive -Algorithm SHA256).Hash.ToLower()
+            $GenuineBinaryHash = (Get-FileHash -Path (Join-Path -Path $SourceDirectory -ChildPath $BinaryFileName) -Algorithm SHA256).Hash.ToLower()
+
+            function New-CachedBinary([string]$Platform, [string]$Content, [string]$MarkerName = '.terraposh-sha256') {
+                $Directory = Get-VendoredPath "terraform_1.9.8_${Platform}"
+                New-Item -Path $Directory -ItemType Directory -Force | Out-Null
+                $Binary = Join-Path -Path $Directory -ChildPath $BinaryFileName
+                Set-Content -Path $Binary -Value $Content -NoNewline
+                $Hash = (Get-FileHash -Path $Binary -Algorithm SHA256).Hash.ToLower()
+                Set-Content -Path (Join-Path -Path $Directory -ChildPath $MarkerName) -Value "${FakeHash}`nsignature=Verified`nbinary=${Hash}" -NoNewline
+                return $Binary
+            }
 
             function Get-VendoredPath([string]$ChildPath) {
                 (Join-Path -Path $TestDrive -ChildPath 'vendored' -AdditionalChildPath $ChildPath) -replace '/', [System.IO.Path]::DirectorySeparatorChar
@@ -607,6 +647,7 @@ InModuleScope terraposh {
         }
 
         BeforeEach {
+            Reset-TerraformBinaryVerificationCache
             $VendoredDirectory = Join-Path -Path $TestDrive -ChildPath 'vendored'
             Remove-Item -Path $VendoredDirectory -Recurse -Force -ErrorAction Ignore
             New-Item -Path $VendoredDirectory -ItemType Directory | Out-Null
@@ -630,7 +671,7 @@ InModuleScope terraposh {
 
             $Binary | Should -Be (Get-VendoredPath "terraform_1.9.8_darwin_arm64/${BinaryFileName}")
             Get-Content -Path $Binary -Raw | Should -Be 'genuine terraform'
-            Get-Content -Path (Get-VendoredPath 'terraform_1.9.8_darwin_arm64/.terraposh-sha256') -Force | Should -Be @($FakeHash, 'signature=Verified')
+            Get-Content -Path (Get-VendoredPath 'terraform_1.9.8_darwin_arm64/.terraposh-sha256') -Force | Should -Be @($FakeHash, 'signature=Verified', "binary=${GenuineBinaryHash}")
             Test-Path -Path (Get-VendoredPath 'terraform_1.9.8_darwin_arm64.zip.download') | Should -BeFalse
             Should -Invoke Invoke-TerraformReleaseRequest -Exactly -Times 1 -ParameterFilter {
                 $Uri -eq 'https://releases.hashicorp.com/terraform/1.9.8/terraform_1.9.8_darwin_arm64.zip'
@@ -706,6 +747,7 @@ InModuleScope terraposh {
                 @{ Case = 'before signature checks existed'; Content = 'HASH' }
                 @{ Case = 'with an Unverified signature'; Content = "HASH`nsignature=Unverified" }
                 @{ Case = 'with signatures Off'; Content = "HASH`nsignature=Off" }
+                @{ Case = 'without a binary hash'; Content = "HASH`nsignature=Verified" }
             ) {
                 $Directory = Get-VendoredPath 'terraform_1.9.8_darwin_arm64'
                 New-Item -Path $Directory -ItemType Directory | Out-Null
@@ -714,7 +756,47 @@ InModuleScope terraposh {
 
                 Get-Content -Path (Get-TerraformBinary -Version '1.9.8') -Raw | Should -Be 'genuine terraform'
                 Should -Invoke Get-TerraformReleaseChecksums -Exactly -Times 1
-                Get-Content -Path (Get-VendoredPath 'terraform_1.9.8_darwin_arm64/.terraposh-sha256') -Force | Should -Be @($FakeHash, 'signature=Verified')
+                Get-Content -Path (Get-VendoredPath 'terraform_1.9.8_darwin_arm64/.terraposh-sha256') -Force | Should -Be @($FakeHash, 'signature=Verified', "binary=${GenuineBinaryHash}")
+            }
+        }
+
+        Context 'cached binary integrity' {
+            It 'reuses a cached binary that matches its recorded hash' {
+                $Binary = New-CachedBinary 'darwin_arm64' 'cached terraform'
+
+                Get-TerraformBinary -Version '1.9.8' | Should -Be $Binary
+                Should -Invoke Get-TerraformReleaseChecksums -Times 0
+            }
+
+            It 'warns and re-extracts a cached binary that was modified' {
+                $Binary = New-CachedBinary 'darwin_arm64' 'cached terraform'
+                Copy-Item -Path $FakeArchive -Destination (Get-VendoredPath 'terraform_1.9.8_darwin_arm64.zip')
+                Set-Content -Path $Binary -Value 'tampered' -NoNewline
+
+                Get-Content -Path (Get-TerraformBinary -Version '1.9.8') -Raw | Should -Be 'genuine terraform'
+                Should -Invoke Write-Warning -Exactly -Times 1 -ParameterFilter { $Message -like 'Cached Terraform binary failed SHA-256 verification*' }
+                Should -Invoke Invoke-TerraformReleaseRequest -Times 0
+                Get-Content -Path (Get-VendoredPath 'terraform_1.9.8_darwin_arm64/.terraposh-sha256') -Force | Should -Be @($FakeHash, 'signature=Verified', "binary=${GenuineBinaryHash}")
+            }
+
+            It 'hashes the cached binary once per command' {
+                $Binary = New-CachedBinary 'darwin_arm64' 'cached terraform'
+                Get-TerraformBinary -Version '1.9.8' | Should -Be $Binary
+                Set-Content -Path $Binary -Value 'tampered' -NoNewline
+
+                Get-TerraformBinary -Version '1.9.8' | Should -Be $Binary
+                Should -Invoke Write-Warning -Times 0
+
+                Reset-TerraformBinaryVerificationCache
+                Get-Content -Path (Get-TerraformBinary -Version '1.9.8') -Raw | Should -Be 'genuine terraform'
+                Should -Invoke Write-Warning -Exactly -Times 1 -ParameterFilter { $Message -like 'Cached Terraform binary failed SHA-256 verification*' }
+            }
+
+            It 'does not hash a binary it just extracted again in the same command' {
+                Get-TerraformBinary -Version '1.9.8' | Out-Null
+                Mock Get-FileSha256 { throw 'should not hash again' }
+
+                { Get-TerraformBinary -Version '1.9.8' } | Should -Not -Throw
             }
         }
 
@@ -762,10 +844,7 @@ InModuleScope terraposh {
 
             It 'uses the binary another run verified while it waited for the lock' {
                 Mock Wait-TerraposhLock {
-                    $Directory = Get-VendoredPath 'terraform_1.9.8_darwin_arm64'
-                    New-Item -Path $Directory -ItemType Directory -Force | Out-Null
-                    Set-Content -Path (Join-Path -Path $Directory -ChildPath $BinaryFileName) -Value 'from the other run' -NoNewline
-                    Set-Content -Path (Join-Path -Path $Directory -ChildPath '.terraposh-sha256') -Value "${FakeHash}`nsignature=Verified" -NoNewline
+                    New-CachedBinary 'darwin_arm64' 'from the other run' | Out-Null
                     [System.IO.File]::Open($Path, 'OpenOrCreate', 'ReadWrite', 'None')
                 }
 
@@ -820,14 +899,24 @@ InModuleScope terraposh {
             }
 
             It 'does not reuse a natively verified amd64 binary as a fallback' {
-                $LegacyDirectory = Get-VendoredPath 'terraform_1.9.8_darwin_amd64'
-                New-Item -Path $LegacyDirectory -ItemType Directory | Out-Null
-                Set-Content -Path (Join-Path -Path $LegacyDirectory -ChildPath $BinaryFileName) -Value 'legacy'
-                Set-Content -Path (Join-Path -Path $LegacyDirectory -ChildPath '.terraposh-sha256') -Value "${FakeHash}`nsignature=Verified" -NoNewline
+                New-CachedBinary 'darwin_amd64' 'native amd64' | Out-Null
 
                 Get-TerraformBinary -Version '1.9.8' | Should -BeLike "*terraform_1.9.8_darwin_arm64*"
                 Should -Invoke Get-TerraformReleaseChecksums -Exactly -Times 1
             }
+        }
+    }
+
+    Describe 'Invoke-Terraposh' {
+        It 'starts each command with a fresh binary verification cache' {
+            Mock Reset-TerraformBinaryVerificationCache {}
+            Mock Get-Config { @{ TerraformVersion = '1.9.8' } }
+            Mock Get-TerraformBinary { 'terraform' }
+            Mock Invoke-Expression { $global:LASTEXITCODE = 0 }
+
+            Invoke-Terraposh -TerraformCommand 'version' -Explicit
+
+            Should -Invoke Reset-TerraformBinaryVerificationCache -Exactly -Times 1
         }
     }
 

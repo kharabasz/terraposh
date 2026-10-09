@@ -21,6 +21,8 @@ function Invoke-Terraposh {
         [switch]$SkipWorkspace
     )
 
+    Reset-TerraformBinaryVerificationCache
+
     # Push to directory
     if (-not [string]::IsNullOrWhiteSpace($Directory)) {
         $Directory = (Resolve-Path -Path $Directory).Path
@@ -627,16 +629,48 @@ function Test-FileChecksum {
     return $ActualHash -ceq $ExpectedHash
 }
 
-function Test-TerraformVerifiedMarker {
+$VerifiedBinaries = @{}
+
+function Reset-TerraformBinaryVerificationCache {
+    $script:VerifiedBinaries = @{}
+}
+
+function Get-FileSha256 {
     param (
         [string]$Path
     )
 
-    if (-not (Test-Path -Path $Path)) {
-        return $false
+    return (Get-FileHash -Path $Path -Algorithm SHA256).Hash.ToLower()
+}
+
+function Get-TerraformCachedBinaryStatus {
+    param (
+        [string]$BinaryFile,
+        [string]$VerifiedFile
+    )
+
+    if (-not (Test-Path -Path $BinaryFile -PathType Leaf) -or -not (Test-Path -Path $VerifiedFile -PathType Leaf)) {
+        return 'Missing'
     }
 
-    return (Get-Content -Path $Path -Force) -ccontains 'signature=Verified'
+    $Marker = @(Get-Content -Path $VerifiedFile -Force)
+    $BinaryHash = ($Marker | Where-Object { $_ -cmatch '^binary=[0-9a-f]{64}$' } | Select-Object -First 1) -replace '^binary=', ''
+
+    if (-not ($Marker -ccontains 'signature=Verified') -or [string]::IsNullOrEmpty($BinaryHash)) {
+        return 'Missing'
+    }
+
+    if ($script:VerifiedBinaries[$BinaryFile] -ceq $BinaryHash) {
+        return 'Valid'
+    }
+
+    if ((Get-FileSha256 -Path $BinaryFile) -cne $BinaryHash) {
+        return 'Modified'
+    }
+
+    $script:VerifiedBinaries[$BinaryFile] = $BinaryHash
+
+    return 'Valid'
 }
 
 function Test-LockContention {
@@ -689,13 +723,16 @@ function Expand-TerraformArchive {
     param (
         [string]$ArchiveFile,
         [string]$ExpandDirectory,
+        [string]$BinaryFile,
         [string]$VerifiedFile,
         [string]$ExpectedHash
     )
 
     Remove-Item -Path $ExpandDirectory -Recurse -Force -ErrorAction Ignore
     Expand-Archive -Path $ArchiveFile -DestinationPath $ExpandDirectory -Force | Out-Null
-    Set-Content -Path $VerifiedFile -Value "${ExpectedHash}`nsignature=Verified" -NoNewline
+    $BinaryHash = Get-FileSha256 -Path $BinaryFile
+    Set-Content -Path $VerifiedFile -Value "${ExpectedHash}`nsignature=Verified`nbinary=${BinaryHash}" -NoNewline
+    $script:VerifiedBinaries[$BinaryFile] = $BinaryHash
 }
 
 function Get-TerraformBinary {
@@ -712,8 +749,14 @@ function Get-TerraformBinary {
     }
 
     foreach ($Candidate in $Candidates) {
-        if ((Test-Path -Path $Candidate.BinaryFile) -and (Test-TerraformVerifiedMarker -Path $Candidate.VerifiedFile)) {
+        $Status = Get-TerraformCachedBinaryStatus -BinaryFile $Candidate.BinaryFile -VerifiedFile $Candidate.VerifiedFile
+
+        if ($Status -eq 'Valid') {
             return $Candidate.BinaryFile
+        }
+
+        if ($Status -eq 'Modified') {
+            Write-Warning -Message "Cached Terraform binary failed SHA-256 verification, re-extracting: $($Candidate.BinaryFile)"
         }
     }
 
@@ -737,7 +780,7 @@ function Get-TerraformBinary {
     $Lock = Wait-TerraposhLock -Path "${OutFile}.lock"
 
     try {
-        if ((Test-Path -Path $BinaryFile) -and (Test-TerraformVerifiedMarker -Path $VerifiedFile)) {
+        if ((Get-TerraformCachedBinaryStatus -BinaryFile $BinaryFile -VerifiedFile $VerifiedFile) -eq 'Valid') {
             return $BinaryFile
         }
 
@@ -763,7 +806,7 @@ function Get-TerraformBinary {
             }
         }
 
-        Expand-TerraformArchive -ArchiveFile $OutFile -ExpandDirectory $ExpandDirectory -VerifiedFile $VerifiedFile -ExpectedHash $ExpectedHash
+        Expand-TerraformArchive -ArchiveFile $OutFile -ExpandDirectory $ExpandDirectory -BinaryFile $BinaryFile -VerifiedFile $VerifiedFile -ExpectedHash $ExpectedHash
 
         return $BinaryFile
     }

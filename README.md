@@ -63,7 +63,7 @@ The config file can contain any number of `TF_CLI_ARGS` and they will all be loa
 
 Terraform binaries are vendored under `~/.terraposh/vendored`. Pin `TerraformVersion` in each repository's `.terraposh.config.json`; if no version is set, terraposh warns and resolves the latest release.
 
-Downloads are only made over HTTPS from HashiCorp's official release server (`https://releases.hashicorp.com`), with redirects refused. Every archive is cross-checked against HashiCorp's published `terraform_<version>_SHA256SUMS` before it is extracted. A download that fails verification is discarded and the command fails; a cached archive that fails verification is re-downloaded.
+Downloads are only made over HTTPS from HashiCorp's official release server (`https://releases.hashicorp.com`), with redirects refused. Every archive is cross-checked against HashiCorp's published `terraform_<version>_SHA256SUMS` before it is extracted. A download that fails verification is discarded and the command fails; a cached archive that fails verification is re-downloaded. The extracted binary's SHA-256 is recorded too and checked once per terraposh command, so a cached binary that has changed is re-extracted from the verified archive.
 
 ### Signature verification
 
