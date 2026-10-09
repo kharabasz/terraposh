@@ -337,21 +337,105 @@ function Get-LatestTerraformVersion {
     return $SemVer
 }
 
-function Get-TerraformBinaryUri {
+function Get-TerraformRelease {
     param (
         [string]$Version
     )
 
     if ([string]::IsNullOrWhiteSpace($Version)) {
+        Write-Warning -Message 'No Terraform version pinned (TerraformVersion / -Version), resolving latest release.'
         $Version = Get-LatestTerraformVersion
     }
 
-    $VersionEncoded = [HttpUtility]::UrlEncode($Version)
-    $OSPart = [HttpUtility]::UrlEncode($IsWindows ? 'windows' : ($IsMacOS ? 'darwin' : 'linux'))
-    $ArchPart = [HttpUtility]::UrlEncode(${env:PROCESSOR_ARCHITECTURE}?.ToLower()) ?? 'amd64'
-    $Uri = "https://releases.hashicorp.com/terraform/${VersionEncoded}/terraform_${VersionEncoded}_${OSPart}_${ArchPart}.zip"
+    $Version = $Version.Trim().TrimStart('v')
 
-    return $Uri
+    # Only allow semver-shaped versions so the value can't alter the release URI path
+    if ($Version -notmatch '^\d+\.\d+\.\d+(-[0-9A-Za-z.]+)?$') {
+        throw "Invalid Terraform version: '${Version}'"
+    }
+
+    $OSPart = $IsWindows ? 'windows' : ($IsMacOS ? 'darwin' : 'linux')
+    $ArchPart = [HttpUtility]::UrlEncode(${env:PROCESSOR_ARCHITECTURE}?.ToLower()) ?? 'amd64'
+    $FileName = "terraform_${Version}_${OSPart}_${ArchPart}.zip"
+    $BaseUri = "https://releases.hashicorp.com/terraform/${Version}"
+
+    return @{
+        Version      = $Version
+        FileName     = $FileName
+        Uri          = "${BaseUri}/${FileName}"
+        ChecksumsUri = "${BaseUri}/terraform_${Version}_SHA256SUMS"
+    }
+}
+
+function Invoke-TerraformReleaseRequest {
+    param (
+        [string]$Uri,
+        [string]$OutFile
+    )
+
+    # Only ever talk to HashiCorp's official release server over HTTPS
+    $ParsedUri = [uri]$Uri
+
+    if ($ParsedUri.Scheme -ne 'https' -or $ParsedUri.Host -ne 'releases.hashicorp.com') {
+        throw "Refusing to download from untrusted location: ${Uri}"
+    }
+
+    $RequestSplat = @{
+        Method             = 'Get'
+        Uri                = $ParsedUri
+        MaximumRedirection = 0
+    }
+
+    if (-not [string]::IsNullOrWhiteSpace($OutFile)) {
+        Invoke-WebRequest @RequestSplat -OutFile $OutFile | Out-Null
+        return
+    }
+
+    $Response = Invoke-WebRequest @RequestSplat
+    $Content = $Response.Content
+
+    if ($Content -is [byte[]]) {
+        $Content = [System.Text.Encoding]::UTF8.GetString($Content)
+    }
+
+    return $Content
+}
+
+function Get-TerraformReleaseChecksum {
+    param (
+        [hashtable]$Release
+    )
+
+    $Checksums = Invoke-TerraformReleaseRequest -Uri $Release.ChecksumsUri
+
+    # SHA256SUMS format: "<sha256>  <filename>"
+    $ChecksumLines = $Checksums -split "`n" | `
+        ForEach-Object { $_.Trim() } | `
+        Where-Object { ($_ -split '\s+', 2)[1] -ceq $Release.FileName }
+
+    if (@($ChecksumLines).Count -ne 1) {
+        throw "Unable to find a single SHA-256 checksum for $($Release.FileName) in $($Release.ChecksumsUri)"
+    }
+
+    $Hash = ($ChecksumLines -split '\s+', 2)[0]
+
+    if ($Hash -notmatch '^[0-9a-fA-F]{64}$') {
+        throw "Malformed SHA-256 checksum for $($Release.FileName): ${Hash}"
+    }
+
+    return $Hash.ToLower()
+}
+
+function Test-FileChecksum {
+    param (
+        [string]$Path,
+        [string]$ExpectedHash
+    )
+
+    $ActualHash = (Get-FileHash -Path $Path -Algorithm SHA256).Hash.ToLower()
+    Write-Verbose -Message "SHA-256 ${Path}: ${ActualHash} (expected ${ExpectedHash})"
+
+    return $ActualHash -ceq $ExpectedHash
 }
 
 function Get-TerraformBinary {
@@ -359,22 +443,47 @@ function Get-TerraformBinary {
         [string]$Version
     )
 
-    $Uri = Get-TerraformBinaryUri -Version $Version
-    $FileName = $Uri -split '/' | Select-Object -Last 1
+    $Release = Get-TerraformRelease -Version $Version
     $OutDirectory = Set-TerraformVendoredDirectory
-    $OutFile = Join-Path -Path $OutDirectory -ChildPath $FileName
-
-    if (-not (Test-Path -Path $OutFile)) {
-        Invoke-RestMethod -Method Get -Uri $Uri -OutFile $OutFile | Out-Null
-    }
-
-    $ExpandDirectory = Join-Path -Path $OutDirectory -ChildPath $FileName.Trim('.zip')
+    $OutFile = Join-Path -Path $OutDirectory -ChildPath $Release.FileName
+    $ExpandDirectory = Join-Path -Path $OutDirectory -ChildPath ([System.IO.Path]::GetFileNameWithoutExtension($Release.FileName))
     $BinaryFileName = Get-TerraformBinaryFileName
     $BinaryFile = Join-Path -Path $ExpandDirectory -ChildPath $BinaryFileName
+    $VerifiedFile = Join-Path -Path $ExpandDirectory -ChildPath '.terraposh-sha256'
 
-    if (-not (Test-Path -Path $BinaryFile)) {
-        Expand-Archive -Path $OutFile -DestinationPath $ExpandDirectory -Force | Out-Null
+    # Already extracted from an archive that passed checksum verification
+    if ((Test-Path -Path $BinaryFile) -and (Test-Path -Path $VerifiedFile)) {
+        return $BinaryFile
     }
+
+    $ExpectedHash = Get-TerraformReleaseChecksum -Release $Release
+
+    if ((Test-Path -Path $OutFile) -and -not (Test-FileChecksum -Path $OutFile -ExpectedHash $ExpectedHash)) {
+        Write-Warning -Message "Cached archive failed SHA-256 verification, re-downloading: ${OutFile}"
+        Remove-Item -Path $OutFile -Force
+    }
+
+    if (-not (Test-Path -Path $OutFile)) {
+        $DownloadFile = "${OutFile}.download"
+
+        try {
+            Invoke-TerraformReleaseRequest -Uri $Release.Uri -OutFile $DownloadFile
+
+            if (-not (Test-FileChecksum -Path $DownloadFile -ExpectedHash $ExpectedHash)) {
+                throw "SHA-256 checksum mismatch for $($Release.Uri), refusing to use it."
+            }
+
+            Move-Item -Path $DownloadFile -Destination $OutFile -Force
+        }
+        finally {
+            Remove-Item -Path $DownloadFile -Force -ErrorAction Ignore
+        }
+    }
+
+    # Discard anything previously extracted without verification
+    Remove-Item -Path $ExpandDirectory -Recurse -Force -ErrorAction Ignore
+    Expand-Archive -Path $OutFile -DestinationPath $ExpandDirectory -Force | Out-Null
+    Set-Content -Path $VerifiedFile -Value $ExpectedHash -NoNewline
 
     return $BinaryFile
 }
