@@ -159,19 +159,35 @@ InModuleScope terraposh {
             { Get-TerraformReleaseChecksums -Release $Release } | Should -Throw '*Malformed SHA256SUMS entry*'
         }
 
-        It 'verifies the downloaded checksum file signature before parsing it' {
+        It 'verifies the downloaded checksum bytes' {
             Mock Assert-TerraformChecksumsSignature {
-                Get-Content -Path $ChecksumsFile -Raw | Should -Be $script:Sums
+                [System.Text.Encoding]::UTF8.GetString($ChecksumsBytes) | Should -BeExactly $script:Sums
             }
 
             Get-TerraformReleaseChecksums -Release $Release | Out-Null
             Should -Invoke Assert-TerraformChecksumsSignature -Exactly -Times 1 -ParameterFilter { $Release.ChecksumsUri -eq 'https://releases.hashicorp.com/terraform/1.9.8/terraform_1.9.8_SHA256SUMS' }
         }
 
-        It 'does not parse checksums whose signature fails' {
+        It 'checks the signature before parsing' {
+            $script:Sums = 'not a checksum file'
             Mock Assert-TerraformChecksumsSignature { throw 'PGP signature verification failed' }
 
             { Get-TerraformReleaseChecksums -Release $Release } | Should -Throw '*PGP signature verification failed*'
+        }
+
+        It 'parses exactly the bytes that were verified' {
+            $script:Downloaded = @{}
+            Mock Invoke-TerraformReleaseRequest {
+                Set-Content -Path $OutFile -Value $script:Sums -NoNewline
+                $script:Downloaded.Path = $OutFile
+            }
+            Mock Assert-TerraformChecksumsSignature {
+                if (Test-Path -Path $script:Downloaded.Path) {
+                    Set-Content -Path $script:Downloaded.Path -Value "$('c' * 64)  terraform_1.9.8_linux_amd64.zip" -NoNewline
+                }
+            }
+
+            (Get-TerraformReleaseChecksums -Release $Release)['terraform_1.9.8_linux_amd64.zip'] | Should -Be ('a' * 64)
         }
 
         It 'cleans up its temporary directory' {
@@ -304,8 +320,7 @@ InModuleScope terraposh {
                 ChecksumsUri = 'https://releases.hashicorp.com/terraform/1.9.8/terraform_1.9.8_SHA256SUMS'
                 SignatureUri = 'https://releases.hashicorp.com/terraform/1.9.8/terraform_1.9.8_SHA256SUMS.72D7468F.sig'
             }
-            $ChecksumsFile = Join-Path -Path $TestDrive -ChildPath 'SHA256SUMS'
-            Set-Content -Path $ChecksumsFile -Value 'sums'
+            $ChecksumsBytes = [System.Text.Encoding]::UTF8.GetBytes("sums`n")
 
             function New-ValidSig([string]$PrimaryFingerprint) {
                 "[GNUPG:] VALIDSIG 374EC75B485913604A831CC7C820C6D5CD27AB87 2024-10-16 1729084074 0 4 0 1 8 00 ${PrimaryFingerprint}"
@@ -319,7 +334,7 @@ InModuleScope terraposh {
         }
 
         It 'accepts a valid signature from the pinned HashiCorp key' {
-            { Assert-TerraformChecksumsSignature -Release $Release -ChecksumsFile $ChecksumsFile } | Should -Not -Throw
+            { Assert-TerraformChecksumsSignature -Release $Release -ChecksumsBytes $ChecksumsBytes } | Should -Not -Throw
 
             Should -Invoke Invoke-TerraformReleaseRequest -Exactly -Times 1 -ParameterFilter { $Uri -eq $Release.SignatureUri }
             Should -Invoke Invoke-Gpgv -Exactly -Times 1 -ParameterFilter { $GpgvPath -eq '/opt/gnupg/bin/gpgv' }
@@ -329,49 +344,49 @@ InModuleScope terraposh {
             Mock Invoke-Gpgv {
                 (Get-ChildItem -Path $WorkingDirectory -Force).Name | Sort-Object | Should -Be @('hashicorp.gpg', 'SHA256SUMS', 'SHA256SUMS.sig')
                 [System.IO.File]::ReadAllBytes((Join-Path -Path $WorkingDirectory -ChildPath 'hashicorp.gpg')) | Should -Be (ConvertFrom-ArmoredPgpKey -Path $HashiCorpKeyFile)
-                Get-Content -Path (Join-Path -Path $WorkingDirectory -ChildPath 'SHA256SUMS') -Raw | Should -Be (Get-Content -Path $ChecksumsFile -Raw)
+                [System.IO.File]::ReadAllBytes((Join-Path -Path $WorkingDirectory -ChildPath 'SHA256SUMS')) | Should -Be $ChecksumsBytes
                 Get-Content -Path (Join-Path -Path $WorkingDirectory -ChildPath 'SHA256SUMS.sig') -Raw | Should -Be "sig$([Environment]::NewLine)"
                 @{ ExitCode = 0; Status = @(New-ValidSig $HashiCorpKeyFingerprint); Errors = @() }
             }
 
-            { Assert-TerraformChecksumsSignature -Release $Release -ChecksumsFile $ChecksumsFile } | Should -Not -Throw
+            { Assert-TerraformChecksumsSignature -Release $Release -ChecksumsBytes $ChecksumsBytes } | Should -Not -Throw
         }
 
         It 'rejects a valid signature from a different key' {
             Mock Invoke-Gpgv { @{ ExitCode = 0; Status = @(New-ValidSig ('0' * 40)); Errors = @() } }
 
-            { Assert-TerraformChecksumsSignature -Release $Release -ChecksumsFile $ChecksumsFile } | Should -Throw '*PGP signature verification failed*'
+            { Assert-TerraformChecksumsSignature -Release $Release -ChecksumsBytes $ChecksumsBytes } | Should -Throw '*PGP signature verification failed*'
         }
 
         It 'rejects a bad signature' {
             Mock Invoke-Gpgv { @{ ExitCode = 1; Status = @('[GNUPG:] BADSIG C820C6D5CD27AB87 HashiCorp'); Errors = @('gpgv: BAD signature') } }
 
-            { Assert-TerraformChecksumsSignature -Release $Release -ChecksumsFile $ChecksumsFile } | Should -Throw '*PGP signature verification failed*BAD signature*'
+            { Assert-TerraformChecksumsSignature -Release $Release -ChecksumsBytes $ChecksumsBytes } | Should -Throw '*PGP signature verification failed*BAD signature*'
         }
 
         It 'rejects a non-zero gpgv exit code even with a VALIDSIG line' {
             Mock Invoke-Gpgv { @{ ExitCode = 2; Status = @(New-ValidSig $HashiCorpKeyFingerprint); Errors = @() } }
 
-            { Assert-TerraformChecksumsSignature -Release $Release -ChecksumsFile $ChecksumsFile } | Should -Throw '*PGP signature verification failed*'
+            { Assert-TerraformChecksumsSignature -Release $Release -ChecksumsBytes $ChecksumsBytes } | Should -Throw '*PGP signature verification failed*'
         }
 
         It 'ignores VALIDSIG text that only appears on stderr' {
             Mock Invoke-Gpgv { @{ ExitCode = 0; Status = @(); Errors = @(New-ValidSig $HashiCorpKeyFingerprint) } }
 
-            { Assert-TerraformChecksumsSignature -Release $Release -ChecksumsFile $ChecksumsFile } | Should -Throw '*PGP signature verification failed*'
+            { Assert-TerraformChecksumsSignature -Release $Release -ChecksumsBytes $ChecksumsBytes } | Should -Throw '*PGP signature verification failed*'
         }
 
         It 'fails when the signature file cannot be downloaded' {
             Mock Invoke-TerraformReleaseRequest { throw 'Response status code does not indicate success: 404 (Not Found).' }
 
-            { Assert-TerraformChecksumsSignature -Release $Release -ChecksumsFile $ChecksumsFile } | Should -Throw '*404*'
+            { Assert-TerraformChecksumsSignature -Release $Release -ChecksumsBytes $ChecksumsBytes } | Should -Throw '*404*'
             Should -Invoke Invoke-Gpgv -Times 0
         }
 
         It 'fails when gpgv is not installed' {
             Mock Get-GpgvPath { $null }
 
-            { Assert-TerraformChecksumsSignature -Release $Release -ChecksumsFile $ChecksumsFile } | Should -Throw '*gpgv is required*'
+            { Assert-TerraformChecksumsSignature -Release $Release -ChecksumsBytes $ChecksumsBytes } | Should -Throw '*gpgv is required*'
             Should -Invoke Invoke-TerraformReleaseRequest -Times 0
         }
     }
@@ -402,6 +417,41 @@ InModuleScope terraposh {
         }
     }
 
+    Describe 'Test-LockContention' {
+        It 'treats HResult <HResult> on <OS> as contention: <Expected>' -TestCases @(
+            @{ OS = 'linux'; HResult = 11; Expected = $true }
+            @{ OS = 'darwin'; HResult = 35; Expected = $true }
+            @{ OS = 'windows'; HResult = -2147024864; Expected = $true }
+            @{ OS = 'windows'; HResult = -2147024863; Expected = $true }
+            @{ OS = 'linux'; HResult = 28; Expected = $false }
+            @{ OS = 'windows'; HResult = 11; Expected = $false }
+        ) {
+            Mock Get-TerraformOS { $OS }
+            $Exception = [System.IO.IOException]::new('io', $HResult)
+
+            Test-LockContention -Exception $Exception | Should -Be $Expected
+        }
+
+        It 'does not treat IOException subclasses as contention' {
+            Test-LockContention -Exception ([System.IO.DirectoryNotFoundException]::new('missing')) | Should -BeFalse
+            Test-LockContention -Exception ([System.IO.FileNotFoundException]::new('missing')) | Should -BeFalse
+        }
+
+        It 'unwraps method invocation errors' {
+            $Lock = Join-Path -Path $TestDrive -ChildPath "$([guid]::NewGuid()).lock"
+            $Held = [System.IO.File]::Open($Lock, 'OpenOrCreate', 'ReadWrite', 'None')
+
+            try {
+                try { [System.IO.File]::Open($Lock, 'OpenOrCreate', 'ReadWrite', 'None') } catch { $Caught = $_.Exception }
+                $Caught | Should -BeOfType [System.Management.Automation.MethodInvocationException]
+                Test-LockContention -Exception $Caught | Should -BeTrue
+            }
+            finally {
+                $Held.Dispose()
+            }
+        }
+    }
+
     Describe 'Wait-TerraposhLock' {
         BeforeEach {
             $LockFile = Join-Path -Path $TestDrive -ChildPath "$([guid]::NewGuid()).lock"
@@ -416,6 +466,14 @@ InModuleScope terraposh {
             finally {
                 $Lock.Dispose()
             }
+        }
+
+        It 'fails immediately on errors other than lock contention' {
+            $Missing = Join-Path -Path $TestDrive -ChildPath 'missing' -AdditionalChildPath 'x.lock'
+            $Stopwatch = [System.Diagnostics.Stopwatch]::StartNew()
+
+            { Wait-TerraposhLock -Path $Missing -TimeoutSeconds 30 } | Should -Throw '*Could not find a part of the path*'
+            $Stopwatch.Elapsed.TotalSeconds | Should -BeLessThan 5
         }
 
         It 'times out while the lock is held' {
@@ -599,7 +657,7 @@ InModuleScope terraposh {
 
         Context 'concurrent runs' {
             It 'holds the release lock while downloading and extracting' {
-                $script:LockState = @{ HeldDuringDownload = $null }
+                $script:LockState = @{ HeldDuringDownload = $null; HeldDuringExtract = $null }
                 Mock Invoke-TerraformReleaseRequest {
                     $LockFile = Get-VendoredPath 'terraform_1.9.8_darwin_arm64.zip.lock'
                     try {
@@ -612,10 +670,23 @@ InModuleScope terraposh {
                     Copy-Item -Path $FakeArchive -Destination $OutFile
                 }
 
+                Mock Expand-TerraformArchive {
+                    $LockFile = Get-VendoredPath 'terraform_1.9.8_darwin_arm64.zip.lock'
+                    try {
+                        [System.IO.File]::Open($LockFile, 'OpenOrCreate', 'ReadWrite', 'None').Dispose()
+                        $script:LockState.HeldDuringExtract = $false
+                    }
+                    catch [System.IO.IOException] {
+                        $script:LockState.HeldDuringExtract = $true
+                    }
+                }
+
                 Get-TerraformBinary -Version '1.9.8' | Out-Null
 
                 Should -Invoke Invoke-TerraformReleaseRequest -Exactly -Times 1
+                Should -Invoke Expand-TerraformArchive -Exactly -Times 1
                 $script:LockState.HeldDuringDownload | Should -BeTrue
+                $script:LockState.HeldDuringExtract | Should -BeTrue
                 { [System.IO.File]::Open((Get-VendoredPath 'terraform_1.9.8_darwin_arm64.zip.lock'), 'OpenOrCreate', 'ReadWrite', 'None').Dispose() } | Should -Not -Throw
             }
 
@@ -735,24 +806,25 @@ InModuleScope terraposh {
             BeforeAll {
                 $ChecksumsFile = Join-Path -Path $TestDrive -ChildPath 'SHA256SUMS'
                 Invoke-TerraformReleaseRequest -Uri $Release.ChecksumsUri -OutFile $ChecksumsFile
+                $ChecksumsBytes = [System.IO.File]::ReadAllBytes($ChecksumsFile)
             }
 
             It 'verifies the real SHA256SUMS signature with gpgv' {
-                { Assert-TerraformChecksumsSignature -Release $Release -ChecksumsFile $ChecksumsFile } | Should -Not -Throw
+                { Assert-TerraformChecksumsSignature -Release $Release -ChecksumsBytes $ChecksumsBytes } | Should -Not -Throw
             }
 
             It 'rejects a tampered SHA256SUMS' {
-                $TamperedFile = Join-Path -Path $TestDrive -ChildPath 'SHA256SUMS.tampered'
-                Set-Content -Path $TamperedFile -Value ((Get-Content -Path $ChecksumsFile -Raw) -replace '^.', '0') -NoNewline
+                $TamperedBytes = [byte[]]$ChecksumsBytes.Clone()
+                $TamperedBytes[0] = $TamperedBytes[0] -bxor 0x01
 
-                { Assert-TerraformChecksumsSignature -Release $Release -ChecksumsFile $TamperedFile } | Should -Throw '*PGP signature verification failed*'
+                { Assert-TerraformChecksumsSignature -Release $Release -ChecksumsBytes $TamperedBytes } | Should -Throw '*PGP signature verification failed*'
             }
 
             It 'rejects the real signature of a different release' {
                 $OtherRelease = $Release.Clone()
                 $OtherRelease.SignatureUri = $Release.SignatureUri -replace '1\.9\.8', '1.9.7'
 
-                { Assert-TerraformChecksumsSignature -Release $OtherRelease -ChecksumsFile $ChecksumsFile } | Should -Throw '*PGP signature verification failed*'
+                { Assert-TerraformChecksumsSignature -Release $OtherRelease -ChecksumsBytes $ChecksumsBytes } | Should -Throw '*PGP signature verification failed*'
             }
         }
     }

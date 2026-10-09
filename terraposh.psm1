@@ -518,7 +518,7 @@ function Invoke-Gpgv {
 function Assert-TerraformChecksumsSignature {
     param (
         [hashtable]$Release,
-        [string]$ChecksumsFile
+        [byte[]]$ChecksumsBytes
     )
 
     $GpgvPath = Get-GpgvPath
@@ -531,7 +531,7 @@ function Assert-TerraformChecksumsSignature {
 
     try {
         [System.IO.File]::WriteAllBytes((Join-Path -Path $WorkDirectory -ChildPath 'hashicorp.gpg'), (ConvertFrom-ArmoredPgpKey -Path $HashiCorpKeyFile))
-        Copy-Item -Path $ChecksumsFile -Destination (Join-Path -Path $WorkDirectory -ChildPath 'SHA256SUMS')
+        [System.IO.File]::WriteAllBytes((Join-Path -Path $WorkDirectory -ChildPath 'SHA256SUMS'), $ChecksumsBytes)
         Invoke-TerraformReleaseRequest -Uri $Release.SignatureUri -OutFile (Join-Path -Path $WorkDirectory -ChildPath 'SHA256SUMS.sig')
         $Result = Invoke-Gpgv -GpgvPath $GpgvPath -WorkingDirectory $WorkDirectory
     }
@@ -561,14 +561,15 @@ function Get-TerraformReleaseChecksums {
     try {
         $ChecksumsFile = Join-Path -Path $WorkDirectory -ChildPath 'SHA256SUMS'
         Invoke-TerraformReleaseRequest -Uri $Release.ChecksumsUri -OutFile $ChecksumsFile
-
-        Assert-TerraformChecksumsSignature -Release $Release -ChecksumsFile $ChecksumsFile
-
-        $Content = Get-Content -Path $ChecksumsFile -Raw
+        $ChecksumsBytes = [System.IO.File]::ReadAllBytes($ChecksumsFile)
     }
     finally {
         Remove-Item -Path $WorkDirectory -Recurse -Force -ErrorAction Ignore
     }
+
+    Assert-TerraformChecksumsSignature -Release $Release -ChecksumsBytes $ChecksumsBytes
+
+    $Content = [System.Text.Encoding]::UTF8.GetString($ChecksumsBytes)
 
     $Checksums = @{}
 
@@ -613,6 +614,26 @@ function Test-TerraformVerifiedMarker {
     return (Get-Content -Path $Path -Force) -ccontains 'signature=Verified'
 }
 
+function Test-LockContention {
+    param (
+        [System.Exception]$Exception
+    )
+
+    while ($Exception -is [System.Management.Automation.MethodInvocationException] -and $Exception.InnerException) {
+        $Exception = $Exception.InnerException
+    }
+
+    if ($Exception.GetType() -ne [System.IO.IOException]) {
+        return $false
+    }
+
+    if ((Get-TerraformOS) -eq 'windows') {
+        return $Exception.HResult -in @(0x80070020, 0x80070021)
+    }
+
+    return $Exception.HResult -in @(11, 35)
+}
+
 function Wait-TerraposhLock {
     param (
         [string]$Path,
@@ -626,6 +647,10 @@ function Wait-TerraposhLock {
             return [System.IO.File]::Open($Path, [System.IO.FileMode]::OpenOrCreate, [System.IO.FileAccess]::ReadWrite, [System.IO.FileShare]::None)
         }
         catch [System.IO.IOException] {
+            if (-not (Test-LockContention -Exception $_.Exception)) {
+                throw
+            }
+
             if ([DateTime]::UtcNow -ge $Deadline) {
                 throw "Timed out after ${TimeoutSeconds}s waiting for another terraposh process to release ${Path}"
             }
@@ -633,6 +658,19 @@ function Wait-TerraposhLock {
             Start-Sleep -Milliseconds 250
         }
     }
+}
+
+function Expand-TerraformArchive {
+    param (
+        [string]$ArchiveFile,
+        [string]$ExpandDirectory,
+        [string]$VerifiedFile,
+        [string]$ExpectedHash
+    )
+
+    Remove-Item -Path $ExpandDirectory -Recurse -Force -ErrorAction Ignore
+    Expand-Archive -Path $ArchiveFile -DestinationPath $ExpandDirectory -Force | Out-Null
+    Set-Content -Path $VerifiedFile -Value "${ExpectedHash}`nsignature=Verified" -NoNewline
 }
 
 function Get-TerraformBinary {
@@ -700,10 +738,7 @@ function Get-TerraformBinary {
             }
         }
 
-        Remove-Item -Path $ExpandDirectory -Recurse -Force -ErrorAction Ignore
-        Expand-Archive -Path $OutFile -DestinationPath $ExpandDirectory -Force | Out-Null
-
-        Set-Content -Path $VerifiedFile -Value "${ExpectedHash}`nsignature=Verified" -NoNewline
+        Expand-TerraformArchive -ArchiveFile $OutFile -ExpandDirectory $ExpandDirectory -VerifiedFile $VerifiedFile -ExpectedHash $ExpectedHash
 
         return $BinaryFile
     }
